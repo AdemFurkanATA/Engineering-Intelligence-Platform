@@ -1,78 +1,111 @@
+"""
+Kafka producer and consumer wrappers for the Engineering Intelligence Platform.
+Both classes gracefully degrade when Kafka is unavailable (useful for local dev).
+"""
 import json
+import logging
 import os
 import asyncio
+from typing import Callable, List
+
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from pydantic import BaseModel
 
-class EventPublisher:
-    def __init__(self):
-        self.bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-        self.producer = None
+logger = logging.getLogger(__name__)
 
-    async def start(self):
-        self.producer = AIOKafkaProducer(
+
+class EventPublisher:
+    """Async Kafka producer. Falls back to no-op logging when Kafka is unreachable."""
+
+    def __init__(self) -> None:
+        self.bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        self._producer: AIOKafkaProducer | None = None
+
+    async def start(self) -> None:
+        self._producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         )
         try:
-            await self.producer.start()
-        except Exception as e:
-            print(f"Warning: Failed to start Kafka producer. Is Kafka running? Error: {e}")
-            self.producer = None
+            await self._producer.start()
+            logger.info("Kafka producer connected to %s", self.bootstrap_servers)
+        except Exception as exc:
+            logger.warning(
+                "Kafka unavailable (%s). Events will be logged locally.", exc
+            )
+            try:
+                await self._producer.stop()
+            except Exception:
+                pass
+            self._producer = None
 
-    async def stop(self):
-        if self.producer:
-            await self.producer.stop()
+    async def stop(self) -> None:
+        if self._producer:
+            await self._producer.stop()
+            logger.info("Kafka producer stopped.")
 
-    async def publish(self, topic: str, event: BaseModel):
-        if not self.producer:
-            print(f"Mock publish to {topic}: {event.model_dump_json(by_alias=True)}")
+    async def publish(self, topic: str, event: BaseModel) -> None:
+        payload = json.loads(event.model_dump_json(by_alias=True))
+        if self._producer is None:
+            logger.info("[NO-KAFKA] topic=%s event_type=%s", topic, payload.get("eventType"))
             return
-        
-        event_dict = json.loads(event.model_dump_json(by_alias=True))
-        await self.producer.send_and_wait(topic, value=event_dict)
+        await self._producer.send_and_wait(topic, value=payload)
+        logger.info("Published %s → %s", payload.get("eventType"), topic)
+
 
 class EventSubscriber:
-    def __init__(self, group_id: str, topics: list):
+    """Async Kafka consumer. Falls back to no-op when Kafka is unreachable."""
+
+    def __init__(self, group_id: str, topics: List[str]) -> None:
         self.bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         self.group_id = group_id
         self.topics = topics
-        self.consumer = None
-        self._running = False
-        self._task = None
-        self._handler = None
+        self._consumer: AIOKafkaConsumer | None = None
+        self._task: asyncio.Task | None = None
 
-    async def start(self, handler):
-        self.consumer = AIOKafkaConsumer(
+    async def start(self, handler: Callable) -> None:
+        self._consumer = AIOKafkaConsumer(
             *self.topics,
             bootstrap_servers=self.bootstrap_servers,
             group_id=self.group_id,
-            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-            auto_offset_reset='earliest'
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            auto_offset_reset="earliest",
         )
-        self._handler = handler
         try:
-            await self.consumer.start()
-            self._running = True
-            self._task = asyncio.create_task(self._consume_loop())
-            print(f"[{self.group_id}] Started listening to {self.topics}")
-        except Exception as e:
-            print(f"[{self.group_id}] Warning: Failed to start Kafka consumer. Is Kafka running? Error: {e}")
-            self.consumer = None
+            await self._consumer.start()
+            self._task = asyncio.create_task(self._consume(handler))
+            logger.info(
+                "[%s] Subscribed to topics: %s", self.group_id, self.topics
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Kafka unavailable (%s). Consumer not started.", self.group_id, exc
+            )
+            try:
+                await self._consumer.stop()
+            except Exception:
+                pass
+            self._consumer = None
 
-    async def _consume_loop(self):
+    async def _consume(self, handler: Callable) -> None:
         try:
-            async for msg in self.consumer:
+            async for msg in self._consumer:
                 try:
-                    await self._handler(msg.topic, msg.value)
-                except Exception as e:
-                    print(f"Error handling message: {e}")
+                    await handler(msg.topic, msg.value)
+                except Exception as exc:
+                    logger.error("Error in event handler: %s", exc, exc_info=True)
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.error("Consumer loop error: %s", exc, exc_info=True)
 
-    async def stop(self):
-        self._running = False
+    async def stop(self) -> None:
         if self._task:
             self._task.cancel()
-        if self.consumer:
-            await self.consumer.stop()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._consumer:
+            await self._consumer.stop()
+            logger.info("[%s] Consumer stopped.", self.group_id)

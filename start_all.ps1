@@ -1,27 +1,40 @@
-$ErrorActionPreference = "Stop"
+# start_all.ps1 — Start all Engineering Intelligence Platform microservices locally
+# Usage: .\start_all.ps1
+# Requires: Python 3.8+ and dependencies from requirements.txt installed.
 
-Write-Host "Starting API Gateway on port 8000"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8000", "--reload" -WorkingDirectory "src\api-gateway"
+$root = $PSScriptRoot
+$py   = "python"  # adjust if python is not in PATH (e.g. "python3" or full path)
 
-Write-Host "Starting Auth Service on port 8001"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8001", "--reload" -WorkingDirectory "src\auth-service"
+$env:PYTHONPATH = "$root\src"
 
-Write-Host "Starting Repository Service on port 8002"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8002", "--reload" -WorkingDirectory "src\repository-service"
+$services = @(
+    @{ name = "api-gateway";        port = 8000 },
+    @{ name = "auth-service";       port = 8001 },
+    @{ name = "repository-service"; port = 8002 },
+    @{ name = "document-service";   port = 8003 },
+    @{ name = "embedding-service";  port = 8004 },
+    @{ name = "graph-service";      port = 8005 },
+    @{ name = "search-service";     port = 8006 },
+    @{ name = "event-service";      port = 8007 }
+)
 
-Write-Host "Starting Document Service on port 8003"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8003", "--reload" -WorkingDirectory "src\document-service"
+Write-Host "Starting Engineering Intelligence Platform services..." -ForegroundColor Cyan
+Write-Host ""
 
-Write-Host "Starting Embedding Service on port 8004"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8004", "--reload" -WorkingDirectory "src\embedding-service"
+foreach ($svc in $services) {
+    $appDir = Join-Path $root "src\$($svc.name)"
+    Start-Process -NoNewWindow -FilePath $py `
+        -ArgumentList "-m", "uvicorn", "main:app",
+                      "--host", "0.0.0.0",
+                      "--port", "$($svc.port)",
+                      "--app-dir", "`"$appDir`"" `
+        -PassThru | Out-Null
+    Write-Host "  Started $($svc.name.PadRight(25)) → http://localhost:$($svc.port)" -ForegroundColor Green
+}
 
-Write-Host "Starting Graph Service on port 8005"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8005", "--reload" -WorkingDirectory "src\graph-service"
-
-Write-Host "Starting Search Service on port 8006"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8006", "--reload" -WorkingDirectory "src\search-service"
-
-Write-Host "Starting Event Service on port 8007"
-Start-Process -NoNewWindow -FilePath "py" -ArgumentList "-m", "uvicorn", "main:app", "--port", "8007", "--reload" -WorkingDirectory "src\event-service"
-
-Write-Host "All services started in background."
+Write-Host ""
+Write-Host "All services started. API Gateway: http://localhost:8000" -ForegroundColor Cyan
+Write-Host "Swagger UI available at http://localhost:8000/docs" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "To stop all services, close the terminal or run:" -ForegroundColor Yellow
+Write-Host "  Get-Process -Name python | Stop-Process -Force" -ForegroundColor Yellow
