@@ -49,6 +49,181 @@ A distributed, event-driven platform that continuously collects, connects, and o
 
 ---
 
+## Search Engine — Technical Implementation
+
+The `search-service` is the core algorithmic component of the platform.  
+It was built to explicitly demonstrate classical computer science concepts applied at production scale.
+
+### 1. Prefix Tree (Trie) — for autocomplete and O(k) prefix search
+
+Every indexed token is inserted into a character-level **Trie**.  
+Each node along the path stores the set of document IDs that contain a word passing through it,  
+enabling O(k) prefix lookup (k = prefix length) without scanning the corpus.
+
+```python
+# src/search-service/trie.py
+class TrieNode:
+    __slots__ = ("children", "is_end", "doc_ids")
+
+    def __init__(self):
+        self.children: Dict[str, "TrieNode"] = {}
+        self.is_end: bool = False
+        self.doc_ids: Set[str] = set()   # docs containing any word through this node
+```
+
+**Live autocomplete endpoint:**
+```bash
+GET /search/suggest?q=pay
+# → { "suggestions": ["payment", "paypal"] }
+```
+
+---
+
+### 2. Fuzzy Search — Levenshtein edit distance
+
+Handles typos and OCR errors using the **Wagner-Fischer dynamic programming** algorithm.  
+Space optimised to O(n) using a single rolling row.  
+An early-exit length filter skips candidates where `|len(a) - len(b)| > max_distance` in O(1).
+
+```python
+# src/search-service/fuzzy.py
+def levenshtein_distance(s1: str, s2: str) -> int:
+    prev = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1, start=1):
+        curr = [i]
+        for j, c2 in enumerate(s2, start=1):
+            cost = 0 if c1 == c2 else 1
+            curr.append(min(curr[j-1]+1, prev[j]+1, prev[j-1]+cost))
+        prev = curr
+    return prev[len(s2)]
+```
+
+**Live fuzzy search — "paymnt" (1 edit away from "payment"):**
+```bash
+GET /search?q=paymnt&maxFuzzyDistance=2
+# → [
+#     { "id": "repo_001", "score": -0.1, "matchType": "fuzzy(editDistance=1)" },
+#     { "id": "repo_003", "score": -0.1, "matchType": "fuzzy(editDistance=1)" }
+#   ]
+```
+
+Also implements **Jaro-Winkler similarity** for name/short-string matching (`fuzzy.jaro_winkler_similarity`).
+
+---
+
+### 3. TF-IDF Ranking — cosine similarity with lazy IDF updates
+
+Ranking uses **TF-IDF cosine similarity** with a smooth IDF formula to avoid zero scores for universal terms.
+
+```
+TF(t, d)  = count(t in d) / |d|
+IDF(t)    = log(N / (df(t) + 1)) + 1          ← smooth variant
+w(t, d)   = TF(t,d) × IDF(t)
+score     = cosine(query_vector, doc_vector)
+```
+
+IDF is computed **lazily** via a dirty flag — only recalculated when the corpus changes,  
+not on every query. Per-document L2 norms are also cached and recomputed only for modified docs.
+
+**Live explain endpoint — inspect IDF per token:**
+```bash
+GET /search/explain?q=payment+billing
+# → {
+#     "tokens": [
+#       { "token": "payment", "idf": 1.2231, "documentFrequency": 3 },
+#       { "token": "billing",  "idf": 1.5108, "documentFrequency": 2 }
+#     ]
+#   }
+```
+"billing" ranks higher (IDF 1.51) because it appears in fewer documents — correctly identified as more discriminative.
+
+---
+
+### 4. Thread Safety & Parallelism
+
+The search engine uses **two levels of concurrency control**:
+
+| Lock | Scope | Protects |
+|------|-------|----------|
+| `asyncio.Lock` | Coroutine level | Serialises concurrent `async` write operations on the index |
+| `threading.RLock` | Thread level | Protects `TFIDFIndex` state accessed from `ThreadPoolExecutor` threads |
+
+CPU-bound work (fuzzy matching over the full vocabulary) is offloaded to a `ThreadPoolExecutor`  
+to keep the asyncio event loop free:
+
+```python
+# src/search-service/engine.py
+fuzzy_distances = await loop.run_in_executor(
+    _executor,          # ThreadPoolExecutor(max_workers=4)
+    bulk_fuzzy_resolve, # pure Python, no asyncio — safe to run in thread
+    tokens,
+    inverted_snapshot,  # shallow copy taken before hand-off for thread safety
+    max_fuzzy_distance,
+)
+```
+
+Parallel document ingestion uses `asyncio.gather`:
+```python
+await asyncio.gather(*[self.add(e["id"], e["type"], e["text"], ...) for e in entries])
+```
+
+---
+
+### 5. Hybrid Scoring Pipeline
+
+Every search request passes through a staged pipeline:
+
+```
+Query
+  │
+  ├─ Inverted Index  ──→  exact matches          (+0.25 bonus)
+  ├─ Trie            ──→  prefix matches          (+0.15 bonus)
+  └─ Levenshtein     ──→  fuzzy matches           (−0.10 × edit_distance)
+         │
+         └─ TF-IDF cosine similarity (base score)
+                  │
+                  └─ Ranked results with matchType explanation
+```
+
+Each result includes `matchType: "exact" | "prefix" | "fuzzy(editDistance=N)"` for full transparency.
+
+**Full search example:**
+```bash
+# Start service
+export PYTHONPATH=src
+uvicorn main:app --port 8006 --app-dir src/search-service
+
+# Index a document
+curl -X POST http://localhost:8006/search/index \
+  -H "Content-Type: application/json" \
+  -d '{"id":"repo_001","type":"Repository","text":"payment service golang microservice billing","metadata":{}}'
+
+# Exact search
+curl "http://localhost:8006/search?q=billing"
+
+# Prefix search (Trie)
+curl "http://localhost:8006/search?q=pay"
+
+# Fuzzy search (typo tolerance)
+curl "http://localhost:8006/search?q=paymnt&maxFuzzyDistance=2"
+
+# Autocomplete
+curl "http://localhost:8006/search/suggest?q=pay"
+
+# Query explanation (TF-IDF)
+curl "http://localhost:8006/search/explain?q=payment+billing"
+```
+
+**Source files:**
+| File | Responsibility |
+|------|---------------|
+| [`src/search-service/trie.py`](src/search-service/trie.py) | Prefix Tree — O(k) prefix search, DFS autocomplete |
+| [`src/search-service/fuzzy.py`](src/search-service/fuzzy.py) | Levenshtein DP, Jaro-Winkler, bulk fuzzy resolve |
+| [`src/search-service/ranking.py`](src/search-service/ranking.py) | TF-IDF with cosine similarity, threading.RLock |
+| [`src/search-service/engine.py`](src/search-service/engine.py) | Unified engine: asyncio.Lock, ThreadPoolExecutor, asyncio.gather |
+
+---
+
 ## Services
 
 | Service            | Port | Description                                           |
