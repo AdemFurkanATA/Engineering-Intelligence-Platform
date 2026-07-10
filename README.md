@@ -1,8 +1,10 @@
 # Engineering Intelligence Platform
 
-> **Phase 1 — Living Knowledge** | Event-Driven Microservices | FastAPI · Kafka · Neo4j · Qdrant
+> **Phase 1 — Living Knowledge** | Event-Driven · Knowledge Graph · Autonomous Engineering Intelligence
 
-A distributed, event-driven platform that continuously collects, connects, and organizes engineering knowledge into a **Living Knowledge Graph** — enabling intelligent search, architectural analysis, and engineering intelligence at scale.
+Engineering Intelligence Platform is a goal-oriented platform that continuously transforms repositories, documentation, and engineering artifacts into an **evolving organizational knowledge graph** — capable of supporting autonomous engineering intelligence.
+
+While most tools help engineers write code, this platform helps engineering organizations *understand* their own systems: what exists, how it connects, what has changed, and what should happen next. The Living Knowledge Graph is not a snapshot — it is a continuously evolving, semantically rich model of an organization's entire engineering reality.
 
 ---
 
@@ -234,7 +236,7 @@ curl "http://localhost:8006/search/explain?q=payment+billing"
 | `document-service` | 8003 | Text extraction, chunking, document management       |
 | `embedding-service`| 8004 | Vector generation, embedding store management        |
 | `graph-service`    | 8005 | Knowledge graph nodes and relationships              |
-| `search-service`   | 8006 | BM25 + semantic hybrid search                        |
+| `search-service`   | 8006 | Hybrid search: TF-IDF cosine similarity + Trie prefix + Levenshtein fuzzy |
 | `event-service`    | 8007 | Event catalog, observability log                     |
 
 ---
@@ -428,13 +430,65 @@ POST /repositories
 
 ## Phase Roadmap
 
-| Phase | Name | Status |
-|-------|------|--------|
-| **Phase 1** | Living Knowledge | ✅ In Progress |
-| Phase 2 | Engineering Intelligence | 📋 Planned |
-| Phase 3 | Autonomous Engineering Intelligence | 📋 Planned |
+| Phase | Name | Status | Key Capability |
+|-------|------|--------|----------------|
+| **Phase 1** | Living Knowledge | ✅ **Complete** | Continuous ingestion, knowledge graph, hybrid search |
+| Phase 2 | Engineering Intelligence | 🔵 Next | Goal API, AI-assisted analysis, workflow automation |
+| Phase 3 | Autonomous Engineering Intelligence | 📋 Planned | Self-improving agents, predictive architecture guidance |
 
-See [`docs/phases.md`](docs/phases.md) for the full roadmap.
+---
+
+## Future Direction — Where This Is Going
+
+Phase 1 establishes the foundation. The platform's true ambition is further:
+
+```
+Phase 1 (Now)            Phase 2                    Phase 3
+─────────────────        ───────────────────────    ─────────────────────────────
+Repositories      →      Goal API               →   Autonomous Agents
+Documentation     →      Planner                →   Self-improving Knowledge
+Knowledge Graph   →      Workflow Orchestration →   Predictive Architecture
+Hybrid Search     →      AI-Assisted Analysis   →   Engineering Intelligence
+Event Streams     →      Recommendations        →   Proactive Guidance
+```
+
+### Goal API (Phase 2)
+
+Engineers express intent, the platform executes:
+```
+POST /goals
+{
+  "goal": "Identify all services with no owner and no documentation",
+  "scope":  { "organizationId": "org_001" }
+}
+```
+The platform decomposes the goal, retrieves relevant knowledge, executes analysis agents, and returns a structured result — not a chat response, but an engineering artifact.
+
+### Planner + Workflow Engine (Phase 2)
+
+Goals are broken into executable plans. Plans trigger workflows. Workflows coordinate agents.  
+Every step is observable, auditable, and replayable via the event stream.
+
+### Autonomous Agents (Phase 3)
+
+Specialised agents operate continuously on the knowledge graph:
+
+| Agent | Responsibility |
+|-------|----------------|
+| Repository Analysis Agent | Extracts architecture from source code |
+| Documentation Agent | Identifies gaps, generates missing docs |
+| Dependency Agent | Maps and monitors inter-service dependencies |
+| ADR Agent | Surfaces relevant architecture decisions |
+| Impact Agent | Predicts blast radius of proposed changes |
+
+Agents are first-class platform principals — authenticated, authorized, and audited identically to human engineers (see [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md)).
+
+### Why This Matters
+
+Most engineering organizations suffer from **institutional amnesia** — knowledge locked in individuals, scattered across wikis, buried in commit history.  
+This platform makes organizational engineering knowledge **persistent, searchable, connected, and continuously evolving**.
+
+The long-term outcome: an engineering organization where the platform understands the system as well as its best engineers do.
 
 ---
 
@@ -450,3 +504,22 @@ Every service exposes Swagger UI at `/docs`:
 - Graph: http://localhost:8005/docs
 - Search: http://localhost:8006/docs
 - Event: http://localhost:8007/docs
+
+---
+
+## Documentation
+
+Full architectural documentation is in [`docs/`](docs/):
+
+| Document | Description |
+|----------|-------------|
+| [`VISION.md`](docs/VISION.md) | Platform vision and long-term objectives |
+| [`phases.md`](docs/phases.md) | 3-phase development roadmap |
+| [`SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md) | Full system architecture |
+| [`API_SPECIFICATION.md`](docs/API_SPECIFICATION.md) | Complete REST API specification |
+| [`EVENT_CATALOG.md`](docs/EVENT_CATALOG.md) | All Kafka event definitions with payloads |
+| [`DATABASE_DESIGN.md`](docs/DATABASE_DESIGN.md) | Polyglot persistence design |
+| [`KNOWLEDGE_GRAPH.md`](docs/KNOWLEDGE_GRAPH.md) | Living Knowledge Graph schema |
+| [`DOMAIN_MODEL.md`](docs/DOMAIN_MODEL.md) | Domain-driven design model |
+| [`AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md) | Multi-agent orchestration design |
+| [`FUNCTIONAL_REQUIREMENTS.md`](docs/FUNCTIONAL_REQUIREMENTS.md) | Traced requirements (FR-100 to FR-900) |
