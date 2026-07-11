@@ -1,0 +1,28 @@
+{
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    "src",
+    "src/api-gateway",
+    "src/auth-service",
+    "src/repository-service",
+    "src/document-service",
+    "src/embedding-service",
+    "src/graph-service",
+    "src/search-service",
+    "src/event-service"
+  ],
+  "include": [
+    "src",
+    "tests"
+  ],
+  "exclude": [
+    ".venv",
+    "**/__pycache__"
+  ],
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false,
+  "typeCheckingMode": "basic"
+}
