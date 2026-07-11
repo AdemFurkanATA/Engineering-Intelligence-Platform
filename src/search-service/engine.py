@@ -220,7 +220,7 @@ class SearchEngine:
             # but necessary to avoid race with concurrent writes in the thread)
             inverted_snapshot = {k: set(v) for k, v in self._inverted.items()}
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             fuzzy_distances = await loop.run_in_executor(
                 _executor,
                 bulk_fuzzy_resolve,

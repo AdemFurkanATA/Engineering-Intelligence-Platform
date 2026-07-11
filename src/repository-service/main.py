@@ -29,6 +29,7 @@ from service import (
     get_repository,
     list_repositories,
     sync_repository,
+    update_repository,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")

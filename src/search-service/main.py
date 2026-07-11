@@ -74,14 +74,16 @@ async def handle_event(topic: str, value: dict) -> None:
 
     elif event_type == "RepositoryUpdated":
         repo_id = payload.get("repositoryId", "")
-        # Re-index with updated data
-        text = " ".join(filter(None, [
-            payload.get("name", ""),
-            payload.get("language", ""),
-            payload.get("url", ""),
-        ]))
-        if text.strip():
-            await engine.add(repo_id, "Repository", text, payload)
+        # RepositoryUpdated payload only contains `changes` (list of field names)
+        # and `updatedBy` — it does NOT carry the full field values.
+        # The document is already indexed from RepositoryCreated; we log the
+        # update for observability but do not attempt a partial re-index with
+        # incomplete data.
+        logger.info(
+            "Search: RepositoryUpdated for %s — changed fields: %s",
+            repo_id,
+            payload.get("changes", []),
+        )
 
     elif event_type == "RepositoryDeleted":
         repo_id = payload.get("repositoryId", "")

@@ -153,21 +153,47 @@ Graph Relationships
 
 ### Search Service
 
-Hybrid Search
+Hybrid Search Engine
 
-Combines
+Combines three complementary retrieval strategies into a single scoring pipeline:
 
-* BM25
-* Semantic Search
-* Graph Traversal
+* Inverted Index — O(1) exact token lookup
+* Prefix Tree (Trie) — O(k) prefix search and autocomplete
+* Fuzzy Matching (Levenshtein) — typo-tolerant edit-distance search
 
-Search must return
+Scoring Pipeline
 
-* Documents
-* Source Code
-* Related Components
-* Graph Relations
-* Similar Knowledge
+```
+Query
+  │
+  ├─ Inverted Index  ──→  exact matches          (+0.25 bonus)
+  ├─ Trie            ──→  prefix matches          (+0.15 bonus)
+  └─ Levenshtein     ──→  fuzzy matches           (−0.10 × edit_distance)
+         │
+         └─ TF-IDF cosine similarity (base score)
+                  │
+                  └─ Ranked results with matchType explanation
+```
+
+Each result carries a `matchType` field: `"exact"` | `"prefix"` | `"fuzzy(editDistance=N)"`.
+
+Endpoints
+
+* `GET /search` — hybrid search with exact, prefix and fuzzy matching
+* `GET /search/suggest` — autocomplete via Trie DFS
+* `GET /search/explain` — per-token IDF scores and document frequency introspection
+* `GET /search/stats` — index statistics (document count, vocabulary size)
+* `GET /search/similar/{id}` — find documents similar to a known indexed document
+* `POST /search/index` — manually index a document (development / testing)
+
+Algorithmic Highlights
+
+* Levenshtein distance computed with Wagner-Fischer DP, space-optimised to O(n) with a rolling row
+* Early-exit length filter: skip candidates where `|len(a) − len(b)| > max_distance` in O(1)
+* IDF computed lazily via dirty flag — recalculated only when the corpus changes
+* Per-document L2 norms cached and recomputed only for modified documents
+* CPU-bound fuzzy resolution offloaded to `ThreadPoolExecutor` to keep the asyncio event loop free
+* Write safety: `asyncio.Lock` serialises coroutine-level writes; `threading.RLock` protects `TFIDFIndex` from executor threads
 
 ---
 
