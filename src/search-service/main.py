@@ -68,22 +68,29 @@ async def handle_event(topic: str, value: dict) -> None:
             payload.get("name", ""),
             payload.get("language", ""),
             payload.get("url", ""),
+            payload.get("description", ""),
         ]))
         await engine.add(repo_id, "Repository", text, payload)
         logger.info("Search: indexed Repository %s", repo_id)
 
     elif event_type == "RepositoryUpdated":
-        repo_id = payload.get("repositoryId", "")
-        # RepositoryUpdated payload only contains `changes` (list of field names)
-        # and `updatedBy` — it does NOT carry the full field values.
-        # The document is already indexed from RepositoryCreated; we log the
-        # update for observability but do not attempt a partial re-index with
-        # incomplete data.
-        logger.info(
-            "Search: RepositoryUpdated for %s — changed fields: %s",
-            repo_id,
-            payload.get("changes", []),
-        )
+        repo_id       = payload.get("repositoryId", "")
+        changed_fields = payload.get("changedFields", {})
+        if changed_fields:
+            # Re-build indexable text from the changed field values
+            text_parts = list(filter(None, changed_fields.values()))
+            if text_parts:
+                text = " ".join(str(v) for v in text_parts)
+                await engine.add(repo_id, "Repository", text, {**payload, **changed_fields})
+                logger.info(
+                    "Search: re-indexed Repository %s — changed fields: %s",
+                    repo_id, list(changed_fields.keys()),
+                )
+        else:
+            logger.info(
+                "Search: RepositoryUpdated for %s — no changedFields in payload, skipping re-index",
+                repo_id,
+            )
 
     elif event_type == "RepositoryDeleted":
         repo_id = payload.get("repositoryId", "")
@@ -92,14 +99,25 @@ async def handle_event(topic: str, value: dict) -> None:
             logger.info("Search: de-indexed Repository %s", repo_id)
 
     elif event_type == "DocumentProcessed":
-        doc_id = payload.get("documentId", "")
-        text = " ".join(filter(None, [
-            payload.get("fileName", ""),
-            payload.get("documentType", ""),
-            payload.get("repositoryId", ""),
-        ]))
+        doc_id       = payload.get("documentId", "")
+        text_preview = payload.get("textPreview", "")
+
+        # Build rich indexable text: real content first, then metadata fallback
+        if text_preview:
+            text = text_preview
+        else:
+            # Fallback for legacy events without textPreview
+            text = " ".join(filter(None, [
+                payload.get("fileName", ""),
+                payload.get("documentType", ""),
+                payload.get("repositoryId", ""),
+            ]))
+
         await engine.add(doc_id, "Document", text, payload)
-        logger.info("Search: indexed Document %s", doc_id)
+        logger.info(
+            "Search: indexed Document %s (words=%d, source=%s)",
+            doc_id, len(text.split()), "textPreview" if text_preview else "metadata-fallback",
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,12 @@
-fastapi==0.103.2
-uvicorn==0.23.2
-pydantic==2.4.2
-httpx==0.25.0
+fastapi>=0.103.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.4.0
+aiokafka>=0.8.0
+httpx>=0.25.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.0
 python-multipart>=0.0.6
+asyncpg>=0.29.0
+neo4j>=5.14.0
+qdrant-client>=1.6.0
+sentence-transformers>=2.7.0

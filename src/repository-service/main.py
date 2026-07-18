@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from shared.database import create_pool, init_schema
 from shared.kafka import EventPublisher
 from shared.models import (
     RepositoryCreatedPayload,
@@ -30,6 +31,7 @@ from service import (
     list_repositories,
     sync_repository,
     update_repository,
+    set_pool,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -40,9 +42,18 @@ publisher = EventPublisher()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # PostgreSQL — graceful degradation: falls back to in-memory if unavailable
+    pool = await create_pool()
+    if pool:
+        await init_schema(pool)
+    set_pool(pool)
+
     await publisher.start()
     yield
+
     await publisher.stop()
+    if pool:
+        await pool.close()
 
 
 app = FastAPI(
@@ -120,9 +131,24 @@ async def update_repo(repo_id: str, req: UpdateRepositoryRequest):
 
     record = result["record"]
     org_id = record["organizationId"]
+
+    # Build changedFields: field_name → new_value, so consumers can re-index
+    field_map = {
+        "name":          "name",
+        "description":   "description",
+        "defaultBranch": "defaultBranch",
+        "visibility":    "visibility",
+    }
+    changed_fields = {
+        key: record[field_map[key]]
+        for key in result["changes"]
+        if key in field_map and field_map[key] in record
+    }
+
     payload = RepositoryUpdatedPayload(
         repositoryId=repo_id,
         changes=result["changes"],
+        changedFields=changed_fields,
         updatedBy=result["updatedBy"],
     )
     event = create_event(

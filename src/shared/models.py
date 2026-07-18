@@ -3,7 +3,7 @@ Shared Pydantic models for the Engineering Intelligence Platform.
 All events follow the EventEnvelope standard defined in EVENT_CATALOG.md.
 """
 from datetime import datetime
-from typing import Any, Optional, List
+from typing import Any, Dict, Optional, List
 from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -47,7 +47,10 @@ class RepositoryCreatedPayload(BaseModel):
 
 class RepositoryUpdatedPayload(BaseModel):
     repository_id: str = Field(..., alias="repositoryId")
-    changes: List[str]
+    changes: List[str]                                         # list of changed field names
+    changed_fields: Dict[str, Any] = Field(                   # field → new value (for re-indexing)
+        default_factory=dict, alias="changedFields"
+    )
     updated_by: str = Field(..., alias="updatedBy")
     updated_at: datetime = Field(default_factory=datetime.utcnow, alias="updatedAt")
 
@@ -73,6 +76,9 @@ class DocumentProcessedPayload(BaseModel):
     file_name: str = Field(..., alias="fileName")
     chunk_count: int = Field(..., alias="chunkCount")
     word_count: int = Field(..., alias="wordCount")
+    text_preview: str = Field(                                 # first ~500 words for search/embedding
+        default="", alias="textPreview"
+    )
     processed_by: str = Field(default="system", alias="processedBy")
     processed_at: datetime = Field(default_factory=datetime.utcnow, alias="processedAt")
 

@@ -10,6 +10,7 @@ from .models import (
     create_event,
 )
 from .kafka import EventPublisher, EventSubscriber
+from .database import create_pool, init_schema
 from . import config
 
 __all__ = [
@@ -24,5 +25,7 @@ __all__ = [
     "create_event",
     "EventPublisher",
     "EventSubscriber",
+    "create_pool",
+    "init_schema",
     "config",
 ]
