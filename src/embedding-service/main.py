@@ -214,6 +214,9 @@ def _store_in_qdrant(doc_id: str, repo_id: str, org_id: str, chunk_texts: List[s
         ))
     _qdrant.upsert(collection_name=COLLECTION_NAME, points=points, wait=True)
     logger.info("Qdrant: upserted %d vectors for doc=%s", len(points), doc_id)
+    # Phase 2 note: _qdrant is the synchronous QdrantClient.  In a high-throughput
+    # production deployment switch to AsyncQdrantClient and await the upsert call
+    # to avoid occupying the event loop thread during network I/O.
 
     # Update metadata index (no vectors stored here — they live in Qdrant)
     _embeddings[doc_id] = {
@@ -377,20 +380,28 @@ def get_embedding(
 
 
 @app.get("/embeddings/search/similar", tags=["Embeddings"])
-def search_similar(
+async def search_similar(
     q: str = Query(..., description="Query text to find similar documents"),
     top_k: int = Query(5, alias="topK", ge=1, le=50),
 ):
     """
     Find documents semantically similar to the query text using Qdrant.
     Only available when Qdrant backend is active.
+
+    The query embedding is computed via the thread-pool executor so the
+    event loop is not blocked by model.encode() (same as the event handler).
+
+    Phase 2 note: _qdrant.search() uses the synchronous Qdrant client.  For
+    high-throughput scenarios switch to qdrant-client's AsyncQdrantClient and
+    await the search call directly.
     """
     if _qdrant is None:
         raise HTTPException(
             status_code=503,
             detail="Semantic similarity search requires Qdrant. Service is running in in-memory mode."
         )
-    query_vector = _embed_texts([q])[0]
+    # Non-blocking: offload model.encode() to thread pool
+    query_vector = (await _embed_texts_async([q]))[0]
     results = _qdrant.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
