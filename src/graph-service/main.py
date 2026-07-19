@@ -44,7 +44,12 @@ _relationships: List[dict] = []      # in-memory fallback
 publisher = EventPublisher()
 subscriber = EventSubscriber(
     group_id="graph-service-group",
-    topics=["repository.created", "repository.updated", "repository.deleted", "document.processed"],
+    topics=[
+        "repository.created", "repository.updated", "repository.deleted",
+        "document.processed",
+        # Phase 2
+        "repository.cloned", "dependency.detected", "commit.analyzed",
+    ],
 )
 
 # ---------------------------------------------------------------------------
@@ -54,11 +59,15 @@ subscriber = EventSubscriber(
 ALLOWED_LABELS: frozenset = frozenset({
     "Repository", "Document", "Developer", "Service",
     "Function", "Class", "API", "Database", "KafkaTopic",
+    # Phase 2
+    "Commit", "Dependency",
 })
 ALLOWED_REL_TYPES: frozenset = frozenset({
     "DESCRIBES", "DEPENDS_ON", "CALLS", "IMPLEMENTS",
     "PRODUCES", "CONSUMES", "MODIFIES", "REFERENCES",
     "CREATED_BY", "RELATED_TO", "BELONGS_TO",
+    # Phase 2
+    "AUTHORED_BY", "COMMITTED_TO", "DETECTED_IN",
 })
 
 
@@ -395,6 +404,85 @@ async def handle_event(topic: str, value: dict) -> None:
             await _add_relationship(doc_id, repo_id, "DESCRIBES")
             rels_created = 1
             logger.info("Graph: Document(%s) -[DESCRIBES]-> Repository(%s)", doc_id, repo_id)
+
+    # ── Phase 2 handlers ────────────────────────────────────────────────────
+
+    elif event_type == "RepositoryCloned":
+        # Update the Repository node with clone metadata (commit count etc.)
+        repo_id = payload.get("repositoryId", "")
+        await _upsert_node(repo_id, "Repository", {
+            "cloneStatus":  "success",
+            "commitCount":  payload.get("commitCount", 0),
+            "sizeKb":       payload.get("sizeKb", 0),
+            "clonedAt":     payload.get("clonedAt", ""),
+        })
+        logger.info("Graph: Repository(%s) updated with clone metadata", repo_id)
+        return  # No GraphUpdated event needed for metadata-only update
+
+    elif event_type == "DependencyDetected":
+        repo_id = payload.get("repositoryId", "")
+        dep_name = payload.get("name", "")
+        dep_ver  = payload.get("version", "")
+        ecosystem = payload.get("ecosystem", "unknown")
+
+        # Use name+ecosystem as stable node ID to deduplicate across repos
+        dep_id = f"dep:{ecosystem}:{dep_name}:{dep_ver}"
+        await _upsert_node(dep_id, "Dependency", {
+            "name":       dep_name,
+            "version":    dep_ver,
+            "ecosystem":  ecosystem,
+            "sourceFile": payload.get("sourceFile", ""),
+        })
+        nodes_created = 1
+
+        if await _node_exists(repo_id):
+            await _add_relationship(repo_id, dep_id, "DEPENDS_ON")
+            rels_created = 1
+            logger.info(
+                "Graph: Repository(%s) -[DEPENDS_ON]-> Dependency(%s@%s, %s)",
+                repo_id, dep_name, dep_ver, ecosystem,
+            )
+
+    elif event_type == "CommitAnalyzed":
+        repo_id      = payload.get("repositoryId", "")
+        sha          = payload.get("sha", "")
+        author_email = payload.get("authorEmail", "")
+        author_name  = payload.get("authorName", "")
+        commit_id    = f"commit:{sha}"
+        dev_id       = f"developer:{author_email}"
+
+        # Create Commit node
+        await _upsert_node(commit_id, "Commit", {
+            "sha":          sha,
+            "message":      (payload.get("message") or "")[:200],
+            "authorEmail":  author_email,
+            "authorName":   author_name,
+            "committedAt":  payload.get("committedAt", ""),
+            "filesChanged": len(payload.get("filesChanged", [])),
+            "repositoryId": repo_id,
+        })
+        nodes_created = 1
+
+        # Create Developer node (MERGE → idempotent)
+        if author_email:
+            await _upsert_node(dev_id, "Developer", {
+                "email": author_email,
+                "name":  author_name,
+            })
+            await _add_relationship(dev_id, commit_id, "AUTHORED_BY")
+            nodes_created += 1
+            rels_created  += 1
+
+        # Link commit to repository
+        if await _node_exists(repo_id):
+            await _add_relationship(commit_id, repo_id, "COMMITTED_TO")
+            rels_created += 1
+
+        logger.info(
+            "Graph: Commit(%s) by %s in Repository(%s)",
+            sha[:8], author_email, repo_id,
+        )
+
     else:
         return
 

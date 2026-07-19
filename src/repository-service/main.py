@@ -20,6 +20,7 @@ from shared.models import (
     RepositoryCreatedPayload,
     RepositoryUpdatedPayload,
     RepositoryDeletedPayload,
+    RepositorySyncRequestedPayload,   # Phase 2: delegate real sync to git-analyzer-service
     create_event,
 )
 from service import (
@@ -183,9 +184,33 @@ async def remove_repo(repo_id: str, deleted_by: str = Query(..., alias="deletedB
 
 
 @app.post("/repositories/{repo_id}/sync", tags=["Repositories"])
-async def trigger_sync(repo_id: str):
-    """FR-110 — Manually trigger repository synchronization."""
+async def trigger_sync(repo_id: str, requested_by: str = Query(default="system", alias="requestedBy")):
+    """FR-110 — Manually trigger repository synchronization.
+
+    Phase 2: publishes RepositorySyncRequested event so git-analyzer-service
+    performs the real clone/dependency-detection/commit-analysis pipeline.
+    The local record is updated with a lastSyncedAt timestamp for bookkeeping.
+    """
     record = await sync_repository(repo_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Repository '{repo_id}' not found.")
-    return {"data": record, "message": "Synchronization triggered."}
+
+    # Publish event → git-analyzer-service will clone and analyze
+    sync_payload = RepositorySyncRequestedPayload(
+        repositoryId=repo_id,
+        url=record.get("url", ""),
+        defaultBranch=record.get("defaultBranch", "main"),
+        requestedBy=requested_by,
+    )
+    event = create_event(
+        event_type="RepositorySyncRequested",
+        aggregate_id=repo_id,
+        organization_id=record.get("organizationId", ""),
+        payload=sync_payload,
+    )
+    await publisher.publish("repository.sync_requested", event)
+    return {
+        "data":    record,
+        "eventId": str(event.event_id),
+        "message": "Sync requested — git-analyzer-service will clone and analyze the repository.",
+    }

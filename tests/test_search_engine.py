@@ -502,6 +502,13 @@ def make_req(**kwargs):
 
 
 class TestRepositoryService:
+    def setup_method(self):
+        """Reset in-memory store between tests to avoid state leakage."""
+        import service as svc
+        svc._store     = {}
+        svc._url_index = {}
+        svc._pool      = None
+
     def test_create_repository(self):
         record = run(create_repository(make_req()))
         assert record["name"] == "payment-service"

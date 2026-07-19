@@ -252,11 +252,11 @@ async def handle_event(topic: str, value: dict) -> None:
 
         await _save_document(doc_id, repo_id, org_id, processed, file_name)
 
-        # text_preview: first 500 words of plain text — carries real content
-        # into the event so search/embedding don't need a separate HTTP call.
-        # NOTE: This README is auto-synthesised from RepositoryCreated metadata.
-        # Real file content will be ingested via POST /documents or Phase 2 Git clone.
-        text_preview = " ".join(processed["plain_text"].split()[:500])
+        # Phase 2: include per-chunk text in the event so embedding-service
+        # can embed each chunk independently (more accurate than textPreview window).
+        text_preview   = " ".join(processed["plain_text"].split()[:500])   # Phase 1 fallback
+        chunk_previews = [c[:500] for c in processed["chunks"]]            # Phase 2: per-chunk
+
 
         out_payload = DocumentProcessedPayload(
             documentId=doc_id,
@@ -265,7 +265,8 @@ async def handle_event(topic: str, value: dict) -> None:
             fileName=file_name,
             chunkCount=len(processed["chunks"]),
             wordCount=processed["word_count"],
-            textPreview=text_preview,
+            textPreview=text_preview,           # Phase 1 fallback preserved
+            chunkPreviews=chunk_previews,       # Phase 2: per-chunk previews
         )
         event = create_event(
             event_type="DocumentProcessed",
@@ -274,7 +275,10 @@ async def handle_event(topic: str, value: dict) -> None:
             payload=out_payload,
         )
         await publisher.publish("document.processed", event)
-        logger.info("DocumentProcessed published: doc_id=%s chunks=%d preview_words=%d", doc_id, len(processed["chunks"]), len(text_preview.split()))
+        logger.info(
+            "DocumentProcessed published: doc_id=%s chunks=%d preview_words=%d chunk_previews=%d",
+            doc_id, len(processed["chunks"]), len(text_preview.split()), len(chunk_previews),
+        )
 
     elif event_type == "RepositoryDeleted":
         repo_id = value.get("payload", {}).get("repositoryId", "")
@@ -361,7 +365,8 @@ async def upload_document(req: UploadDocumentRequest):
         doc_id, req.repository_id, req.organization_id, processed, req.file_name
     )
 
-    text_preview = " ".join(processed["plain_text"].split()[:500])
+    text_preview   = " ".join(processed["plain_text"].split()[:500])
+    chunk_previews = [c[:500] for c in processed["chunks"]]  # Phase 2: per-chunk previews
 
     out_payload = DocumentProcessedPayload(
         documentId=doc_id,
@@ -370,7 +375,8 @@ async def upload_document(req: UploadDocumentRequest):
         fileName=req.file_name,
         chunkCount=len(processed["chunks"]),
         wordCount=processed["word_count"],
-        textPreview=text_preview,
+        textPreview=text_preview,         # Phase 1 fallback
+        chunkPreviews=chunk_previews,     # Phase 2: accurate per-chunk text
     )
     event = create_event(
         event_type="DocumentProcessed",

@@ -53,6 +53,9 @@ subscriber = EventSubscriber(
         "repository.updated",
         "repository.deleted",
         "document.processed",
+        # Phase 2
+        "dependency.detected",
+        "commit.analyzed",
     ],
 )
 
@@ -118,11 +121,14 @@ async def handle_event(topic: str, value: dict) -> None:
             logger.info("Search: de-indexed Repository %s", repo_id)
 
     elif event_type == "DocumentProcessed":
-        doc_id       = payload.get("documentId", "")
-        text_preview = payload.get("textPreview", "")
+        doc_id        = payload.get("documentId", "")
+        text_preview  = payload.get("textPreview", "")
+        chunk_previews = payload.get("chunkPreviews", [])
 
-        # Build rich indexable text: real content first, then metadata fallback
-        if text_preview:
+        # Phase 2: prefer per-chunk previews for richer content indexing
+        if chunk_previews:
+            text = " ".join(chunk_previews)
+        elif text_preview:
             text = text_preview
         else:
             # Fallback for legacy events without textPreview
@@ -133,10 +139,38 @@ async def handle_event(topic: str, value: dict) -> None:
             ]))
 
         await engine.add(doc_id, "Document", text, payload)
+        source = "chunkPreviews" if chunk_previews else ("textPreview" if text_preview else "metadata-fallback")
         logger.info(
             "Search: indexed Document %s (words=%d, source=%s)",
-            doc_id, len(text.split()), "textPreview" if text_preview else "metadata-fallback",
+            doc_id, len(text.split()), source,
         )
+
+    # ── Phase 2 handlers ────────────────────────────────────────────────────
+
+    elif event_type == "DependencyDetected":
+        repo_id   = payload.get("repositoryId", "")
+        dep_name  = payload.get("name", "")
+        version   = payload.get("version", "")
+        ecosystem = payload.get("ecosystem", "")
+        # Use stable dep_id (same as graph service)
+        dep_id = f"dep:{ecosystem}:{dep_name}:{version}"
+        text = " ".join(filter(None, [dep_name, ecosystem, version,
+                                       payload.get("sourceFile", "")]))
+        await engine.add(dep_id, "Dependency", text, {
+            **payload,
+            "repositoryId": repo_id,
+        })
+        logger.info("Search: indexed Dependency %s (%s) for repo %s", dep_name, ecosystem, repo_id)
+
+    elif event_type == "CommitAnalyzed":
+        sha     = payload.get("sha", "")
+        message = payload.get("message", "")
+        author  = payload.get("authorName", "") + " " + payload.get("authorEmail", "")
+        commit_id = f"commit:{sha}"
+        text = " ".join(filter(None, [message, author.strip()]))
+        if text.strip():
+            await engine.add(commit_id, "Commit", text, payload)
+            logger.info("Search: indexed Commit %s", sha[:8])
 
 
 # ---------------------------------------------------------------------------

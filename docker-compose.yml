@@ -134,6 +134,36 @@ services:
     networks:
       - eip_network
 
+  # -----------------------------------------------------
+  # Phase 2 — Git Analyzer Service (port 8008)
+  # Clones repositories, detects dependencies, reads commits
+  # and publishes domain events to Kafka.
+  # -----------------------------------------------------
+  git-analyzer-service:
+    image: python:3.11-slim
+    container_name: eip_git_analyzer
+    working_dir: /app
+    volumes:
+      - ./src/git-analyzer-service:/app
+      - ./src/shared:/app/../shared
+      - git_clone_tmp:/tmp/eip-clones
+    command: >
+      sh -c "pip install -q -r requirements.txt &&
+             uvicorn main:app --host 0.0.0.0 --port 8008 --reload"
+    ports:
+      - "8008:8008"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      GIT_MAX_COMMITS: "100"
+      GIT_CLONE_TIMEOUT_SEC: "120"
+      GIT_CLONE_DIR: "/tmp/eip-clones"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - eip_network
+
 volumes:
   postgres_data:
   redis_data:
@@ -141,6 +171,7 @@ volumes:
   neo4j_data:
   neo4j_logs:
   qdrant_data:
+  git_clone_tmp:
 
 networks:
   eip_network:

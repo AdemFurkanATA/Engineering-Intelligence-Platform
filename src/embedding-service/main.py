@@ -242,17 +242,25 @@ async def handle_event(topic: str, value: dict) -> None:
     if event_type != "DocumentProcessed":
         return
 
-    payload     = value.get("payload", {})
-    doc_id      = payload.get("documentId", "")
-    repo_id     = payload.get("repositoryId", "")
-    org_id      = value.get("organizationId", "")
-    chunk_count = max(payload.get("chunkCount", 1), 1)
-    text_preview = payload.get("textPreview", "")
+    payload       = value.get("payload", {})
+    doc_id        = payload.get("documentId", "")
+    repo_id       = payload.get("repositoryId", "")
+    org_id        = value.get("organizationId", "")
+    chunk_count   = max(payload.get("chunkCount", 1), 1)
+    text_preview  = payload.get("textPreview", "")
+    chunk_previews = payload.get("chunkPreviews", [])
 
-    # Use real text from the event payload when available.
-    # text_preview carries the first ~500 words of actual document content.
-    # If absent (legacy event), fall back to identifier-based placeholder.
-    if text_preview:
+    # Phase 2: use per-chunk previews from document-service for accurate embeddings.
+    # Fallback chain:
+    #   1. chunkPreviews list (Phase 2 — exact chunk boundaries from document-service)
+    #   2. textPreview split (Phase 1 approximation)
+    #   3. Identifier placeholder (legacy / empty content)
+    if chunk_previews:
+        # Filter empty strings; pad or trim to match chunkCount
+        chunk_texts = [c.strip() or f"{doc_id}:chunk:{i}" for i, c in enumerate(chunk_previews)]
+        # If document-service sent more/fewer chunks than chunkCount, trust chunkPreviews
+        chunk_count = len(chunk_texts)
+    elif text_preview:
         words = text_preview.split()
         chunk_size = max(len(words) // chunk_count, 1)
         chunk_texts = [
@@ -265,9 +273,12 @@ async def handle_event(topic: str, value: dict) -> None:
     else:
         # Fallback: placeholder text (no real content in event)
         logger.warning(
-            "No textPreview in DocumentProcessed event for doc=%s — using placeholder embedding", doc_id
+            "No chunkPreviews or textPreview in DocumentProcessed event for doc=%s "
+            "— using placeholder embedding", doc_id
         )
         chunk_texts = [f"{doc_id}:chunk:{i}" for i in range(chunk_count)]
+
+
 
     # Non-blocking embedding: run model.encode() in thread pool executor
     vectors = await _embed_texts_async(chunk_texts)

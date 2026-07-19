@@ -66,8 +66,65 @@ class RepositoryDeletedPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — Git Analyzer Event Payloads
+# ---------------------------------------------------------------------------
+
+class RepositorySyncRequestedPayload(BaseModel):
+    """Published by repository-service when a sync is triggered.
+    git-analyzer-service listens and performs the actual clone/analysis."""
+    repository_id: str = Field(..., alias="repositoryId")
+    url: str
+    default_branch: str = Field(default="main", alias="defaultBranch")
+    requested_by: str = Field(..., alias="requestedBy")
+    requested_at: datetime = Field(default_factory=datetime.utcnow, alias="requestedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RepositoryClonedPayload(BaseModel):
+    """Published by git-analyzer-service after a successful clone."""
+    repository_id: str = Field(..., alias="repositoryId")
+    url: str
+    default_branch: str = Field(..., alias="defaultBranch")
+    commit_count: int = Field(..., alias="commitCount")
+    size_kb: int = Field(default=0, alias="sizeKb")
+    cloned_at: datetime = Field(default_factory=datetime.utcnow, alias="clonedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class DependencyDetectedPayload(BaseModel):
+    """Published by git-analyzer-service for each dependency found in the repo.
+    ecosystem: 'pip' | 'npm' | 'go' | 'cargo' | 'maven' | 'unknown'
+    """
+    repository_id: str = Field(..., alias="repositoryId")
+    name: str
+    version: str = ""
+    ecosystem: str = "unknown"                                  # pip / npm / go / cargo
+    source_file: str = Field(default="", alias="sourceFile")   # e.g. requirements.txt
+    detected_at: datetime = Field(default_factory=datetime.utcnow, alias="detectedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CommitAnalyzedPayload(BaseModel):
+    """Published by git-analyzer-service for each commit processed."""
+    repository_id: str = Field(..., alias="repositoryId")
+    sha: str
+    author_email: str = Field(..., alias="authorEmail")
+    author_name: str = Field(default="", alias="authorName")
+    message: str = ""
+    files_changed: List[str] = Field(default_factory=list, alias="filesChanged")
+    committed_at: datetime = Field(..., alias="committedAt")
+    analyzed_at: datetime = Field(default_factory=datetime.utcnow, alias="analyzedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
 # Document Event Payloads
 # ---------------------------------------------------------------------------
+
 
 class DocumentProcessedPayload(BaseModel):
     document_id: str = Field(..., alias="documentId")
@@ -76,9 +133,13 @@ class DocumentProcessedPayload(BaseModel):
     file_name: str = Field(..., alias="fileName")
     chunk_count: int = Field(..., alias="chunkCount")
     word_count: int = Field(..., alias="wordCount")
-    text_preview: str = Field(                                 # first ~500 words for search/embedding
+    text_preview: str = Field(                                 # first ~500 words (Phase 1 fallback)
         default="", alias="textPreview"
     )
+    chunk_previews: List[str] = Field(                         # per-chunk text (Phase 2 — preferred)
+        default_factory=list, alias="chunkPreviews"
+    )
+
     processed_by: str = Field(default="system", alias="processedBy")
     processed_at: datetime = Field(default_factory=datetime.utcnow, alias="processedAt")
 
