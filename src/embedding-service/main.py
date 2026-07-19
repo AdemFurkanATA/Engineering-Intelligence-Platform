@@ -30,12 +30,14 @@ Phase 1 limitations (explicitly acknowledged)
 
 Model is loaded once at startup and reused for all requests.
 """
+import asyncio
 import hashlib
 import logging
 import math
 import os
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -66,6 +68,8 @@ STUB_DIM        = 128
 _model       = None            # SentenceTransformer instance or None
 _qdrant      = None            # QdrantClient instance or None
 _embeddings: Dict[str, dict] = {}   # in-memory fallback: doc_id → metadata
+# Thread pool for CPU-bound model.encode() so the event loop is never blocked
+_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embed")
 
 publisher = EventPublisher()
 subscriber = EventSubscriber(
@@ -155,11 +159,23 @@ def _stub_embed(text: str) -> List[float]:
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    """Generate embeddings for a list of texts using the loaded model or stub."""
+    """Generate embeddings synchronously (runs inside executor thread)."""
     if _model is not None:
         vectors = _model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
         return [v.tolist() for v in vectors]
     return [_stub_embed(t) for t in texts]
+
+
+async def _embed_texts_async(texts: List[str]) -> List[List[float]]:
+    """Non-blocking wrapper — offloads CPU-bound model.encode() to thread pool.
+
+    sentence-transformers encode() is synchronous and can take 50-500 ms per
+    batch.  Running it directly in an async handler blocks the event loop for
+    all concurrent requests.  This wrapper delegates to a ThreadPoolExecutor
+    so the event loop stays responsive.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _embed_texts, texts)
 
 
 def _active_model_name() -> str:
@@ -189,27 +205,26 @@ def _store_in_qdrant(doc_id: str, repo_id: str, org_id: str, chunk_texts: List[s
             id=point_id,
             vector=vector,
             payload={
-                "document_id":   doc_id,
-                "repository_id": repo_id,
+                "document_id":     doc_id,
+                "repository_id":   repo_id,
                 "organization_id": org_id,
-                "chunk_index":   i,
-                "text_preview":  text[:200],   # store first 200 chars for retrieval preview
+                "chunk_index":     i,
+                "text_preview":    text[:200],
             },
         ))
     _qdrant.upsert(collection_name=COLLECTION_NAME, points=points, wait=True)
     logger.info("Qdrant: upserted %d vectors for doc=%s", len(points), doc_id)
 
-
-def _store_in_memory(doc_id: str, repo_id: str, org_id: str, vectors: List[List[float]]) -> None:
+    # Update metadata index (no vectors stored here — they live in Qdrant)
     _embeddings[doc_id] = {
-        "documentId":    doc_id,
-        "repositoryId":  repo_id,
+        "documentId":     doc_id,
+        "repositoryId":   repo_id,
         "organizationId": org_id,
-        "modelName":     _active_model_name(),
-        "vectorDim":     _active_dim(),
-        "chunkCount":    len(vectors),
-        "generatedAt":   _now_iso(),
-        "vectors":       vectors,
+        "modelName":      _active_model_name(),
+        "vectorDim":      _active_dim(),
+        "chunkCount":     len(vectors),
+        "generatedAt":    _now_iso(),
+        "backend":        "qdrant",
     }
 
 
@@ -251,24 +266,29 @@ async def handle_event(topic: str, value: dict) -> None:
         )
         chunk_texts = [f"{doc_id}:chunk:{i}" for i in range(chunk_count)]
 
-    vectors = _embed_texts(chunk_texts)
+    # Non-blocking embedding: run model.encode() in thread pool executor
+    vectors = await _embed_texts_async(chunk_texts)
 
     if _qdrant is not None:
+        # _store_in_qdrant writes vectors to Qdrant AND updates _embeddings
+        # metadata index (without raw vectors — they live in Qdrant).
         _store_in_qdrant(doc_id, repo_id, org_id, chunk_texts, vectors)
     else:
-        _store_in_memory(doc_id, repo_id, org_id, vectors)
-
-    # Build and store metadata record regardless of backend
-    _embeddings[doc_id] = {
-        "documentId":    doc_id,
-        "repositoryId":  repo_id,
-        "organizationId": org_id,
-        "modelName":     _active_model_name(),
-        "vectorDim":     _active_dim(),
-        "chunkCount":    len(vectors),
-        "generatedAt":   _now_iso(),
-        "backend":       "qdrant" if _qdrant else "in-memory",
-    }
+        # In-memory path: single write that includes raw vectors so that
+        # GET /embeddings/{id}?includeVectors=true returns them correctly.
+        # Previously _store_in_memory() wrote vectors but was immediately
+        # overwritten by a metadata-only dict — vectors were silently lost.
+        _embeddings[doc_id] = {
+            "documentId":     doc_id,
+            "repositoryId":   repo_id,
+            "organizationId": org_id,
+            "modelName":      _active_model_name(),
+            "vectorDim":      _active_dim(),
+            "chunkCount":     len(vectors),
+            "generatedAt":    _now_iso(),
+            "backend":        "in-memory",
+            "vectors":        vectors,   # preserved — not overwritten
+        }
 
     out_payload = EmbeddingGeneratedPayload(
         documentId=doc_id,
@@ -304,6 +324,7 @@ async def lifespan(app: FastAPI):
     await publisher.stop()
     if _qdrant is not None:
         _qdrant.close()
+    _executor.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------

@@ -166,26 +166,32 @@ async def _neo4j_list_nodes(label: Optional[str]) -> List[dict]:
         # Whitelist prevents Cypher injection via label parameter
         if label not in ALLOWED_LABELS:
             raise ValueError(f"Unknown label: {label!r}. Allowed: {sorted(ALLOWED_LABELS)}")
-        query = f"MATCH (n:`{label}`) RETURN n ORDER BY n.createdAt DESC"
+        query = f"MATCH (n:`{label}`) RETURN n, labels(n) AS lbls ORDER BY n.createdAt DESC"
     else:
-        query = "MATCH (n) RETURN n ORDER BY n.createdAt DESC"
+        # Include labels(n) so we always know the real label — without this
+        # the response previously returned "Unknown" for every unfiltered node.
+        query = "MATCH (n) RETURN n, labels(n) AS lbls ORDER BY n.createdAt DESC"
     async with _driver.session() as session:
         result = await session.run(query)
         records = await result.data()
     nodes = []
     for r in records:
         n = dict(r["n"])
-        node_id = n.pop("nodeId", None)
+        lbls = r.get("lbls", [])
+        node_id    = n.pop("nodeId",    None)
         created_at = n.pop("createdAt", _now_iso())
         updated_at = n.pop("updatedAt", _now_iso())
         nodes.append({
             "nodeId":     node_id,
-            "label":      label or "Unknown",
+            # Use the queried label arg if provided (already validated),
+            # otherwise fall back to the first label from Neo4j.
+            "label":      label or (lbls[0] if lbls else "Unknown"),
             "properties": n,
             "createdAt":  created_at,
             "updatedAt":  updated_at,
         })
     return nodes
+
 
 
 async def _neo4j_get_node(node_id: str) -> Optional[dict]:
