@@ -12,8 +12,21 @@ Storage strategy
 ----------------
 1. Model:  sentence-transformers/all-MiniLM-L6-v2 (384-dim, free, local)
            Falls back to deterministic hash stub if model load fails.
+           Qdrant backend is DISABLED when model is unavailable to prevent
+           dimension mismatch (stub=128-dim vs collection=384-dim).
 2. Store:  Qdrant collection "engineering-documents"
            Falls back to in-memory dict if Qdrant is unavailable.
+
+Phase 1 limitations (explicitly acknowledged)
+---------------------------------------------
+- Chunk text source: DocumentProcessed.textPreview carries the first ~500
+  words of a document.  This text is split into per-chunk windows and
+  embedded.  It is NOT byte-identical to the chunk boundaries stored in
+  document-service — it is a text window approximation.
+- Phase 2 path: embedding-service should call
+  GET /documents/{id}/chunks on document-service, or DocumentProcessed
+  should carry a chunkPreviews list, so every chunk gets an accurate
+  independent embedding.  This is a known deferred improvement.
 
 Model is loaded once at startup and reused for all requests.
 """
@@ -79,8 +92,24 @@ async def _init_model() -> None:
 
 
 async def _init_qdrant() -> None:
-    """Connect to Qdrant and ensure the collection exists."""
+    """Connect to Qdrant and ensure the collection exists.
+
+    IMPORTANT: Qdrant is only activated when the real embedding model is
+    loaded.  The stub embedder produces STUB_DIM (128-dim) vectors, while the
+    collection is built for VECTOR_DIM (384-dim).  Mixing them would cause an
+    upsert error.  If the model failed to load we skip Qdrant and use the
+    in-memory store instead — no data is silently corrupted.
+    """
     global _qdrant
+
+    if _model is None:
+        logger.warning(
+            "Embedding model not loaded — Qdrant backend DISABLED to prevent "
+            "dimension mismatch (model=128-dim stub vs collection=384-dim). "
+            "Using in-memory vector store."
+        )
+        return
+
     try:
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
@@ -90,21 +119,27 @@ async def _init_qdrant() -> None:
         client.get_collections()
         _qdrant = client
 
-        # Create collection if it doesn't exist
+        # Create collection with the actual model dimension (always VECTOR_DIM
+        # here because we guard against model=None above)
+        active_dim = _active_dim()
         existing = {c.name for c in _qdrant.get_collections().collections}
         if COLLECTION_NAME not in existing:
             _qdrant.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=active_dim, distance=Distance.COSINE),
             )
-            logger.info("Qdrant collection '%s' created (dim=%d, cosine).", COLLECTION_NAME, VECTOR_DIM)
+            logger.info(
+                "Qdrant collection '%s' created (dim=%d, cosine).",
+                COLLECTION_NAME, active_dim,
+            )
         else:
             logger.info("Qdrant collection '%s' already exists.", COLLECTION_NAME)
 
-        logger.info("Qdrant connected: %s", QDRANT_URL)
+        logger.info("Qdrant connected: %s (model=%s, dim=%d)", QDRANT_URL, MODEL_NAME, active_dim)
     except Exception as exc:
         logger.warning("Qdrant unavailable (%s). Using in-memory vector store.", exc)
         _qdrant = None
+
 
 
 # ---------------------------------------------------------------------------

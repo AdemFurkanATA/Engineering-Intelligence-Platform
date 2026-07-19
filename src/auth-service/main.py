@@ -61,7 +61,16 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 # Seed default users
 # ---------------------------------------------------------------------------
-
+# Phase 1 limitation (explicitly acknowledged):
+# Default credentials are hardcoded here for local development.  The startup
+# guard in `lifespan()` refuses to boot with these in production (ENV=production).
+#
+# Phase 2 path: replace this list with env-var / secret-manager driven seed:
+#   SEED_USER_0=admin:password:admin:org_001
+#   SEED_USER_1=engineer:password:engineer:org_001
+# This allows operators to supply secure credentials at deploy time without
+# rebuilding the image.  Until then, production deployments MUST override
+# admin credentials via POST /users after first boot with a custom admin account.
 _DEFAULT_USERS = [
     {"user_id": "user_admin",    "username": "admin",    "password": "admin",    "role": "admin",    "organization_id": "org_001"},
     {"user_id": "user_engineer", "username": "engineer", "password": "engineer", "role": "engineer", "organization_id": "org_001"},

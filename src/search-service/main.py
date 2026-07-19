@@ -74,23 +74,42 @@ async def handle_event(topic: str, value: dict) -> None:
         logger.info("Search: indexed Repository %s", repo_id)
 
     elif event_type == "RepositoryUpdated":
-        repo_id       = payload.get("repositoryId", "")
+        repo_id        = payload.get("repositoryId", "")
         changed_fields = payload.get("changedFields", {})
+
         if changed_fields:
-            # Re-build indexable text from the changed field values
-            text_parts = list(filter(None, changed_fields.values()))
-            if text_parts:
-                text = " ".join(str(v) for v in text_parts)
-                await engine.add(repo_id, "Repository", text, {**payload, **changed_fields})
-                logger.info(
-                    "Search: re-indexed Repository %s — changed fields: %s",
-                    repo_id, list(changed_fields.keys()),
-                )
+            # engine.add() fully replaces the indexed document, so we MUST
+            # merge the incoming changedFields with the previously indexed
+            # metadata snapshot — otherwise unchanged tokens (name, language,
+            # url) are lost from the index when only e.g. visibility changes.
+            existing_doc  = engine._docs.get(repo_id, {})
+            existing_meta = existing_doc.get("metadata", {})
+            merged_meta   = {**existing_meta, **changed_fields}
+
+            # Rebuild full indexable text from the merged snapshot
+            text = " ".join(filter(None, [
+                str(merged_meta.get("name",          "")),
+                str(merged_meta.get("language",      "")),
+                str(merged_meta.get("url",           "")),
+                str(merged_meta.get("description",   "")),
+                str(merged_meta.get("visibility",    "")),
+                str(merged_meta.get("defaultBranch", "")),
+            ]))
+            if not text.strip():
+                # Last resort: at least index the changed values
+                text = " ".join(str(v) for v in changed_fields.values() if v)
+
+            await engine.add(repo_id, "Repository", text, merged_meta)
+            logger.info(
+                "Search: re-indexed Repository %s (merged snapshot) — changed: %s",
+                repo_id, list(changed_fields.keys()),
+            )
         else:
             logger.info(
                 "Search: RepositoryUpdated for %s — no changedFields in payload, skipping re-index",
                 repo_id,
             )
+
 
     elif event_type == "RepositoryDeleted":
         repo_id = payload.get("repositoryId", "")

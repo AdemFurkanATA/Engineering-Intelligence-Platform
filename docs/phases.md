@@ -29,10 +29,46 @@ This phase is entirely focused on **building knowledge**, not making decisions.
 * Build the complete microservice architecture.
 * Create the event-driven communication infrastructure.
 * Design the Knowledge Graph model.
-* Build document ingestion pipelines.
-* Build repository ingestion pipelines.
-* Implement hybrid search.
-* Continuously synchronize incoming changes.
+* Build document ingestion pipelines (manual upload + auto-README on registration).
+* Build repository registration and metadata management.
+* Implement hybrid search (TF-IDF + Trie + Levenshtein).
+* Generate real vector embeddings and store in Qdrant.
+* Persist data to PostgreSQL, Neo4j, and Qdrant with in-memory fallback.
+
+---
+
+## Phase 1 MVP Scope — What IS and IS NOT included
+
+### ✅ Delivered in Phase 1
+
+| Capability | Implementation |
+|---|---|
+| Repository CRUD + events | Full (PostgreSQL) |
+| Document upload + chunking | Full (PostgreSQL, `POST /documents`) |
+| Auto-README on repo registration | Synthetic from metadata (see note below) |
+| Hybrid search | Full (Trie + Levenshtein + TF-IDF, real text content) |
+| Knowledge Graph | Repository + Document nodes, DESCRIBES relationships (Neo4j) |
+| Vector embeddings | Real (all-MiniLM-L6-v2, Qdrant) from `textPreview` field |
+| JWT auth + bcrypt | Full (PostgreSQL-backed users) |
+| Event-driven pipeline | Kafka (RepositoryCreated → DocumentProcessed → EmbeddingGenerated → GraphUpdated) |
+
+### ❌ Deferred to Phase 2 (NOT Phase 1 deliverables)
+
+| Capability | Phase |
+|---|---|
+| Git repository cloning | Phase 2 |
+| Automatic pull / commit detection | Phase 2 |
+| Branch / PR / release tracking | Phase 2 |
+| Per-chunk accurate embeddings | Phase 2 (see embedding service docs) |
+| Env-var driven user seeding | Phase 2 (see auth service docs) |
+| AI-powered decision layer | Phase 3+ |
+
+> **Note on auto-README:** When a repository is registered via `POST /repositories`,
+> document-service synthesises a README from the registration metadata
+> (name, language, URL).  This is a demo placeholder — it provides a real
+> document for the search and embedding pipeline to exercise.  Real file
+> content is ingested through `POST /documents` in Phase 1 or the Git clone
+> pipeline in Phase 2.
 
 ---
 
@@ -64,17 +100,19 @@ Responsibilities
 
 ### Repository Service
 
-Responsible for monitoring software repositories.
+Responsible for repository metadata management and event publishing.
 
-Features
+**Phase 1 MVP features**
 
-* Clone repositories
+* Register repositories (CRUD)
+* Store metadata in PostgreSQL
+* Publish RepositoryCreated / Updated / Deleted events to Kafka
+
+**Phase 2 features** *(not in Phase 1)*
+
+* Clone repositories via Git
 * Pull updates automatically
-* Detect commits
-* Detect branches
-* Detect pull requests
-* Detect releases
-* Produce events into Kafka
+* Detect commits, branches, pull requests, releases
 
 ---
 
@@ -105,10 +143,16 @@ Responsibilities
 
 Responsibilities
 
-* Generate embeddings
-* Store vectors
+* Generate embeddings using `sentence-transformers/all-MiniLM-L6-v2` (384-dim)
+* Store vectors in Qdrant
 * Re-index modified documents
 * Version embeddings
+
+**Phase 1 limitation:** Embeddings use the `textPreview` field from the
+`DocumentProcessed` event (first ~500 words), split into per-chunk text
+windows.  This is accurate for content ranking but not byte-identical to
+the chunk boundaries in document-service.
+**Phase 2** will fetch exact chunk text via `GET /documents/{id}/chunks`.
 
 ---
 

@@ -336,12 +336,31 @@ async def handle_event(topic: str, value: dict) -> None:
         logger.info("Graph: created/updated Repository node %s", repo_id)
 
     elif event_type == "RepositoryUpdated":
-        repo_id = payload.get("repositoryId", "")
-        if not _driver and repo_id in _nodes:
-            for change in payload.get("changes", []):
-                _nodes[repo_id]["properties"][change] = payload.get(change)
-            _nodes[repo_id]["updatedAt"] = _now_iso()
-        logger.info("Graph: updated Repository node %s", repo_id)
+        repo_id       = payload.get("repositoryId", "")
+        changed_fields = payload.get("changedFields", {})
+
+        if changed_fields:
+            if _driver:
+                # _upsert_node uses MERGE + ON MATCH SET so only the supplied
+                # properties are updated; other node properties are untouched.
+                await _upsert_node(repo_id, "Repository", changed_fields)
+            else:
+                # In-memory: patch only the changed properties into the
+                # existing node so the full snapshot is preserved.
+                if repo_id in _nodes:
+                    _nodes[repo_id]["properties"].update(changed_fields)
+                    _nodes[repo_id]["updatedAt"] = _now_iso()
+            nodes_created = 0   # update, not creation
+            logger.info(
+                "Graph: updated Repository node %s — fields: %s",
+                repo_id, list(changed_fields.keys()),
+            )
+        else:
+            logger.info(
+                "Graph: RepositoryUpdated for %s — no changedFields, skipping graph update",
+                repo_id,
+            )
+
 
     elif event_type == "RepositoryDeleted":
         repo_id = payload.get("repositoryId", "")
