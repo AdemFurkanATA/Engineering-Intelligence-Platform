@@ -93,6 +93,19 @@ class RepositoryClonedPayload(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class RepositoryCloneFailedPayload(BaseModel):
+    """Published by git-analyzer-service when a clone attempt fails.
+    Downstream services (graph, UI) use this to mark the repository's
+    cloneStatus as 'failed' so operators can investigate and retry.
+    """
+    repository_id: str = Field(..., alias="repositoryId")
+    url: str
+    error: str = ""                                             # truncated exception message
+    failed_at: datetime = Field(default_factory=datetime.utcnow, alias="failedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class DependencyDetectedPayload(BaseModel):
     """Published by git-analyzer-service for each dependency found in the repo.
     ecosystem: 'pip' | 'npm' | 'go' | 'cargo' | 'maven' | 'unknown'

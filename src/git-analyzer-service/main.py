@@ -1,4 +1,4 @@
-﻿"""
+"""
 git-analyzer-service — FastAPI application.
 
 Phase 2 responsibilities:
@@ -40,6 +40,7 @@ from shared.models import (
     CommitAnalyzedPayload,
     DependencyDetectedPayload,
     RepositoryClonedPayload,
+    RepositoryCloneFailedPayload,
     create_event,
 )
 from parsers import python_parser, node_parser, go_parser, rust_parser
@@ -80,9 +81,14 @@ async def _clone_and_analyze(repo_id: str, url: str, org_id: str, branch: str = 
     try:
         import git as gitpython
     except ImportError:
-        logger.error(
-            "GitPython not installed — cannot clone repo %s. "
-            "Install gitpython in the service container.", repo_id
+        error_msg = "GitPython not installed — cannot clone repo"
+        logger.error("%s %s. Install gitpython in the service container.", error_msg, repo_id)
+        await publisher.publish(
+            "repository.clone_failed",
+            create_event("RepositoryCloneFailed", repo_id, org_id,
+                         RepositoryCloneFailedPayload(
+                             repositoryId=repo_id, url=url, error=error_msg
+                         )),
         )
         return
 
@@ -99,7 +105,15 @@ async def _clone_and_analyze(repo_id: str, url: str, org_id: str, branch: str = 
             kill_after_timeout=GIT_CLONE_TIMEOUT_SEC,
         )
     except Exception as exc:
-        logger.error("Clone failed for %s: %s", url, exc)
+        error_msg = str(exc)[:500]  # truncate long stack traces
+        logger.error("Clone failed for %s: %s", url, error_msg)
+        await publisher.publish(
+            "repository.clone_failed",
+            create_event("RepositoryCloneFailed", repo_id, org_id,
+                         RepositoryCloneFailedPayload(
+                             repositoryId=repo_id, url=url, error=error_msg
+                         )),
+        )
         return
 
     root = Path(clone_dir)

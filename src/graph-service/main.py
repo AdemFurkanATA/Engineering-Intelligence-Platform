@@ -48,7 +48,8 @@ subscriber = EventSubscriber(
         "repository.created", "repository.updated", "repository.deleted",
         "document.processed",
         # Phase 2
-        "repository.cloned", "dependency.detected", "commit.analyzed",
+        "repository.cloned", "repository.clone_failed",
+        "dependency.detected", "commit.analyzed",
     ],
 )
 
@@ -419,6 +420,17 @@ async def handle_event(topic: str, value: dict) -> None:
         logger.info("Graph: Repository(%s) updated with clone metadata", repo_id)
         return  # No GraphUpdated event needed for metadata-only update
 
+    elif event_type == "RepositoryCloneFailed":
+        # Mark repository node so operators / UI know sync failed
+        repo_id = payload.get("repositoryId", "")
+        await _upsert_node(repo_id, "Repository", {
+            "cloneStatus": "failed",
+            "cloneError":  payload.get("error", "")[:200],
+            "failedAt":    payload.get("failedAt", ""),
+        })
+        logger.warning("Graph: Repository(%s) clone FAILED — %s", repo_id, payload.get("error", "")[:80])
+        return  # No GraphUpdated event needed
+
     elif event_type == "DependencyDetected":
         repo_id = payload.get("repositoryId", "")
         dep_name = payload.get("name", "")
@@ -597,4 +609,457 @@ async def graph_stats():
         "totalRelationships":  len(_relationships),
         "nodesByLabel":        labels,
         "relationshipsByType": rel_types,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dependency Analyzer helpers
+# ---------------------------------------------------------------------------
+
+def _mem_dep_analysis(repo_id: str) -> dict:
+    """Analyse dependency graph in in-memory mode."""
+    # All DEPENDS_ON edges where source == repo_id
+    dep_ids = {
+        r["to"] for r in _relationships
+        if r["from"] == repo_id and r["type"] == "DEPENDS_ON"
+    }
+    if not dep_ids:
+        return {
+            "repositoryId":        repo_id,
+            "totalDependencies":   0,
+            "circularDependencies": [],
+            "criticalNodes":       [],
+            "bottleneckScore":     0.0,
+            "ecosystemBreakdown":  {},
+        }
+
+    # Build adjacency for deps (dep → repos that use it, for in-degree)
+    dep_in_degree: dict[str, int] = {}
+    for dep_id in dep_ids:
+        count = sum(
+            1 for r in _relationships
+            if r["to"] == dep_id and r["type"] == "DEPENDS_ON"
+        )
+        dep_in_degree[dep_id] = count
+
+    max_in_degree = max(dep_in_degree.values(), default=0)
+
+    # Circular dependency: in in-memory MVP, detect if any dep node
+    # also has a DEPENDS_ON edge pointing back (simplified check).
+    circular = []
+    for dep_id in dep_ids:
+        for r in _relationships:
+            if r["from"] == dep_id and r["to"] == repo_id and r["type"] == "DEPENDS_ON":
+                dep_props = _nodes.get(dep_id, {}).get("properties", {})
+                circular.append(dep_props.get("name", dep_id))
+
+    # Critical nodes: in-degree >= 2
+    critical = []
+    total_repos = max(
+        len({r["from"] for r in _relationships if r["type"] == "DEPENDS_ON"}), 1
+    )
+    for dep_id, in_deg in sorted(dep_in_degree.items(), key=lambda x: -x[1]):
+        if in_deg >= 2:
+            props = _nodes.get(dep_id, {}).get("properties", {})
+            critical.append({
+                "name":      props.get("name", dep_id),
+                "version":   props.get("version", ""),
+                "ecosystem": props.get("ecosystem", "unknown"),
+                "inDegree":  in_deg,
+                "score":     round(in_deg / total_repos, 4),
+            })
+
+    bottleneck_score = round(max_in_degree / total_repos, 4) if total_repos else 0.0
+
+    # Ecosystem breakdown
+    ecosystem_counts: dict[str, int] = {}
+    for dep_id in dep_ids:
+        eco = _nodes.get(dep_id, {}).get("properties", {}).get("ecosystem", "unknown")
+        ecosystem_counts[eco] = ecosystem_counts.get(eco, 0) + 1
+
+    return {
+        "repositoryId":        repo_id,
+        "totalDependencies":   len(dep_ids),
+        "circularDependencies": circular,
+        "criticalNodes":       critical,
+        "bottleneckScore":     bottleneck_score,
+        "ecosystemBreakdown":  ecosystem_counts,
+    }
+
+
+async def _neo4j_dep_analysis(repo_id: str) -> dict:
+    """Analyse dependency graph using Neo4j Cypher."""
+    async with _driver.session() as session:
+        # Per-dependency in-degree across all repos
+        result = await session.run(
+            """
+            MATCH (r:Repository {nodeId: $repoId})-[:DEPENDS_ON]->(d:Dependency)
+            OPTIONAL MATCH (other:Repository)-[:DEPENDS_ON]->(d)
+            WITH d, count(DISTINCT other) AS inDegree
+            RETURN d.nodeId AS depId, d.name AS name, d.version AS version,
+                   d.ecosystem AS ecosystem, inDegree
+            ORDER BY inDegree DESC
+            """,
+            repoId=repo_id,
+        )
+        rows = await result.data()
+
+    if not rows:
+        return {
+            "repositoryId":        repo_id,
+            "totalDependencies":   0,
+            "circularDependencies": [],
+            "criticalNodes":       [],
+            "bottleneckScore":     0.0,
+            "ecosystemBreakdown":  {},
+        }
+
+    total_repos_result = await _driver.session().__aenter__()
+    async with _driver.session() as session:
+        r2 = await (await session.run(
+            "MATCH (r:Repository) RETURN count(r) AS cnt"
+        )).single()
+    total_repos = max((r2["cnt"] if r2 else 1), 1)
+
+    max_in_degree = max((row["inDegree"] for row in rows), default=0)
+    bottleneck_score = round(max_in_degree / total_repos, 4)
+
+    critical = [
+        {
+            "name":      row["name"],
+            "version":   row["version"] or "",
+            "ecosystem": row["ecosystem"] or "unknown",
+            "inDegree":  row["inDegree"],
+            "score":     round(row["inDegree"] / total_repos, 4),
+        }
+        for row in rows if row["inDegree"] >= 2
+    ]
+
+    ecosystem_counts: dict[str, int] = {}
+    for row in rows:
+        eco = row["ecosystem"] or "unknown"
+        ecosystem_counts[eco] = ecosystem_counts.get(eco, 0) + 1
+
+    # Circular deps: repos that appear as both source and target in DEPENDS_ON paths
+    async with _driver.session() as session:
+        circ_result = await session.run(
+            """
+            MATCH (r:Repository {nodeId: $repoId})-[:DEPENDS_ON]->(d:Dependency)
+            -[:DEPENDS_ON]->(r)
+            RETURN d.name AS name
+            """,
+            repoId=repo_id,
+        )
+        circ_rows = await circ_result.data()
+    circular = [row["name"] for row in circ_rows]
+
+    return {
+        "repositoryId":        repo_id,
+        "totalDependencies":   len(rows),
+        "circularDependencies": circular,
+        "criticalNodes":       critical,
+        "bottleneckScore":     bottleneck_score,
+        "ecosystemBreakdown":  ecosystem_counts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dependency Analyzer endpoints
+# NOTE: Static paths (/critical, /ecosystem) MUST be registered before the
+# parametric /{repo_id} path, otherwise FastAPI will match "critical" and
+# "ecosystem" as repo_id values.
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/analysis/dependencies/critical", tags=["Analysis"])
+async def critical_dependencies(threshold: int = Query(default=2, ge=1)):
+    """List the most-used dependencies across all repositories.
+
+    A dependency is 'critical' if it is used by at least `threshold` repositories.
+    """
+    if _driver:
+        async with _driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (r:Repository)-[:DEPENDS_ON]->(d:Dependency)
+                WITH d, count(DISTINCT r) AS usedBy
+                WHERE usedBy >= $threshold
+                RETURN d.name AS name, d.version AS version,
+                       d.ecosystem AS ecosystem, usedBy
+                ORDER BY usedBy DESC
+                """,
+                threshold=threshold,
+            )
+            rows = await result.data()
+        async with _driver.session() as session:
+            tr = await (await session.run("MATCH (r:Repository) RETURN count(r) AS cnt")).single()
+        total_repos = (tr["cnt"] if tr else 1) or 1
+        deps = [
+            {
+                "name":             row["name"],
+                "version":          row["version"] or "",
+                "ecosystem":        row["ecosystem"] or "unknown",
+                "usedByRepos":      row["usedBy"],
+                "criticalityScore": round(row["usedBy"] / total_repos, 4),
+            }
+            for row in rows
+        ]
+    else:
+        # In-memory path
+        dep_counts: dict[str, int] = {}
+        for r in _relationships:
+            if r["type"] == "DEPENDS_ON":
+                dep_counts[r["to"]] = dep_counts.get(r["to"], 0) + 1
+        total_repos = max(
+            len({r["from"] for r in _relationships if r["type"] == "DEPENDS_ON"}), 1
+        )
+        deps = []
+        for dep_id, count in sorted(dep_counts.items(), key=lambda x: -x[1]):
+            if count >= threshold:
+                props = _nodes.get(dep_id, {}).get("properties", {})
+                deps.append({
+                    "name":             props.get("name", dep_id),
+                    "version":          props.get("version", ""),
+                    "ecosystem":        props.get("ecosystem", "unknown"),
+                    "usedByRepos":      count,
+                    "criticalityScore": round(count / total_repos, 4),
+                })
+
+    return {
+        "criticalDependencies": deps,
+        "threshold":            threshold,
+        "analyzedAt":           _now_iso(),
+    }
+
+
+@app.get("/graph/analysis/dependencies/ecosystem", tags=["Analysis"])
+async def ecosystem_breakdown():
+    """Return dependency ecosystem distribution across the entire organisation."""
+    if _driver:
+        async with _driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (d:Dependency)
+                RETURN d.ecosystem AS ecosystem, count(d) AS cnt
+                ORDER BY cnt DESC
+                """
+            )
+            rows = await result.data()
+        ecosystems = {(row["ecosystem"] or "unknown"): row["cnt"] for row in rows}
+        total = sum(ecosystems.values())
+        async with _driver.session() as session:
+            ur = await (await session.run(
+                "MATCH (d:Dependency) RETURN count(DISTINCT d.name) AS cnt"
+            )).single()
+        unique = ur["cnt"] if ur else 0
+    else:
+        ecosystems: dict[str, int] = {}
+        unique_names: set[str] = set()
+        for node in _nodes.values():
+            if node["label"] == "Dependency":
+                eco = node["properties"].get("ecosystem", "unknown")
+                ecosystems[eco] = ecosystems.get(eco, 0) + 1
+                unique_names.add(node["properties"].get("name", ""))
+        total = sum(ecosystems.values())
+        unique = len(unique_names)
+
+    return {
+        "ecosystems":         ecosystems,
+        "totalDependencies":  total,
+        "uniquePackages":     unique,
+        "analyzedAt":         _now_iso(),
+    }
+
+
+@app.get("/graph/analysis/dependencies/{repo_id}", tags=["Analysis"])
+async def analyze_dependencies(repo_id: str):
+    """Analyse the dependency graph for a single repository.
+
+    Returns circular dependency detection, critical nodes (high in-degree),
+    bottleneck score, and ecosystem breakdown.
+    """
+    if not await _node_exists(repo_id):
+        raise HTTPException(status_code=404, detail=f"Repository '{repo_id}' not found in graph.")
+
+    if _driver:
+        result = await _neo4j_dep_analysis(repo_id)
+    else:
+        result = _mem_dep_analysis(repo_id)
+
+    result["analyzedAt"] = _now_iso()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Timeline Engine helpers
+# ---------------------------------------------------------------------------
+
+def _mem_timeline(repo_id: str, since: Optional[str], until: Optional[str],
+                  limit: int, event_type_filter: str) -> list:
+    """Build timeline from in-memory graph for a single repo."""
+    events = []
+
+    if event_type_filter in ("all", "commit"):
+        for node in _nodes.values():
+            if node["label"] != "Commit":
+                continue
+            props = node["properties"]
+            if props.get("repositoryId") != repo_id:
+                continue
+            ts = props.get("committedAt", "")
+            if since and ts and ts < since:
+                continue
+            if until and ts and ts > until:
+                continue
+            events.append({
+                "type":        "commit",
+                "timestamp":   ts,
+                "sha":         props.get("sha", ""),
+                "message":     props.get("message", ""),
+                "authorEmail": props.get("authorEmail", ""),
+                "authorName":  props.get("authorName", ""),
+                "filesChanged": props.get("filesChanged", 0),
+            })
+
+    if event_type_filter in ("all", "dependency"):
+        for node in _nodes.values():
+            if node["label"] != "Dependency":
+                continue
+            # Check if this dep is linked to the repo
+            linked = any(
+                r["from"] == repo_id and r["to"] == node["nodeId"]
+                and r["type"] == "DEPENDS_ON"
+                for r in _relationships
+            )
+            if not linked:
+                continue
+            ts = node.get("createdAt", "")
+            if since and ts and ts < since:
+                continue
+            if until and ts and ts > until:
+                continue
+            props = node["properties"]
+            events.append({
+                "type":           "dependency_added",
+                "timestamp":      ts,
+                "dependencyName": props.get("name", ""),
+                "ecosystem":      props.get("ecosystem", "unknown"),
+                "version":        props.get("version", ""),
+            })
+
+    # Sort by timestamp descending
+    events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    return events[:limit]
+
+
+async def _neo4j_timeline(repo_id: str, since: Optional[str], until: Optional[str],
+                           limit: int, event_type_filter: str) -> list:
+    """Build timeline from Neo4j for a single repo."""
+    events = []
+
+    if event_type_filter in ("all", "commit"):
+        params: dict = {"repoId": repo_id, "limit": limit}
+        conditions = ["c.repositoryId = $repoId"]
+        if since:
+            conditions.append("c.committedAt >= $since")
+            params["since"] = since
+        if until:
+            conditions.append("c.committedAt <= $until")
+            params["until"] = until
+        where = "WHERE " + " AND ".join(conditions)
+        async with _driver.session() as session:
+            result = await session.run(
+                f"""
+                MATCH (c:Commit)
+                {where}
+                RETURN c.sha AS sha, c.message AS message,
+                       c.authorEmail AS authorEmail, c.authorName AS authorName,
+                       c.committedAt AS committedAt, c.filesChanged AS filesChanged
+                ORDER BY c.committedAt DESC
+                LIMIT $limit
+                """,
+                **params,
+            )
+            rows = await result.data()
+        for row in rows:
+            events.append({
+                "type":        "commit",
+                "timestamp":   row.get("committedAt", ""),
+                "sha":         row.get("sha", ""),
+                "message":     row.get("message", ""),
+                "authorEmail": row.get("authorEmail", ""),
+                "authorName":  row.get("authorName", ""),
+                "filesChanged": row.get("filesChanged", 0),
+            })
+
+    if event_type_filter in ("all", "dependency"):
+        dep_params: dict = {"repoId": repo_id, "limit": limit}
+        async with _driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (r:Repository {nodeId: $repoId})-[:DEPENDS_ON]->(d:Dependency)
+                RETURN d.name AS name, d.ecosystem AS ecosystem,
+                       d.version AS version, d.createdAt AS createdAt
+                ORDER BY d.createdAt DESC
+                LIMIT $limit
+                """,
+                **dep_params,
+            )
+            rows = await result.data()
+        for row in rows:
+            ts = row.get("createdAt", "")
+            if since and ts and ts < since:
+                continue
+            if until and ts and ts > until:
+                continue
+            events.append({
+                "type":           "dependency_added",
+                "timestamp":      ts,
+                "dependencyName": row.get("name", ""),
+                "ecosystem":      row.get("ecosystem", "unknown"),
+                "version":        row.get("version", ""),
+            })
+
+    events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    return events[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Timeline Engine endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/timeline/{repo_id}", tags=["Analysis"])
+async def repository_timeline(
+    repo_id: str,
+    since:      Optional[str] = Query(None,   description="ISO datetime lower bound"),
+    until:      Optional[str] = Query(None,   description="ISO datetime upper bound"),
+    limit:      int           = Query(50,     ge=1, le=500),
+    event_type: str           = Query("all",  description="'commit' | 'dependency' | 'all'"),
+):
+    """Return a time-ordered event stream for a repository.
+
+    Merges commits and dependency additions into a single chronological list.
+    Supports filtering by time range and event type.
+    """
+    if event_type not in ("all", "commit", "dependency"):
+        raise HTTPException(
+            status_code=422,
+            detail="event_type must be 'all', 'commit', or 'dependency'",
+        )
+
+    if not await _node_exists(repo_id):
+        raise HTTPException(status_code=404, detail=f"Repository '{repo_id}' not found in graph.")
+
+    if _driver:
+        events = await _neo4j_timeline(repo_id, since, until, limit, event_type)
+    else:
+        events = _mem_timeline(repo_id, since, until, limit, event_type)
+
+    return {
+        "repositoryId": repo_id,
+        "events":       events,
+        "total":        len(events),
+        "since":        since,
+        "until":        until,
+        "eventType":    event_type,
+        "generatedAt":  _now_iso(),
     }
