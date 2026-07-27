@@ -714,12 +714,13 @@ async def _neo4j_dep_analysis(repo_id: str) -> dict:
             "ecosystemBreakdown":  {},
         }
 
-    total_repos_result = await _driver.session().__aenter__()
+    # Count total repos to normalise in-degree scores
     async with _driver.session() as session:
         r2 = await (await session.run(
             "MATCH (r:Repository) RETURN count(r) AS cnt"
         )).single()
     total_repos = max((r2["cnt"] if r2 else 1), 1)
+
 
     max_in_degree = max((row["inDegree"] for row in rows), default=0)
     bottleneck_score = round(max_in_degree / total_repos, 4)
