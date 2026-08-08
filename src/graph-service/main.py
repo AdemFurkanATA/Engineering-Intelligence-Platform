@@ -50,6 +50,8 @@ subscriber = EventSubscriber(
         # Phase 2
         "repository.cloned", "repository.clone_failed",
         "dependency.detected", "commit.analyzed",
+        # Phase 2.3
+        "architecture.analyzed",
     ],
 )
 
@@ -493,6 +495,51 @@ async def handle_event(topic: str, value: dict) -> None:
         logger.info(
             "Graph: Commit(%s) by %s in Repository(%s)",
             sha[:8], author_email, repo_id,
+        )
+
+    elif event_type == "ArchitectureAnalyzed":
+        repo_id       = payload.get("repositoryId", "")
+        symbols       = payload.get("symbols", [])
+        relations     = payload.get("relations", [])
+
+        # Upsert Function / Class nodes
+        for sym in symbols:
+            sym_name  = sym.get("name", "")
+            sym_type  = sym.get("symbolType", "function")   # "function" | "class"
+            sym_label = "Class" if sym_type == "class" else "Function"
+            sym_id    = f"{repo_id}:{sym.get('filePath', '')}:{sym_name}"
+            await _upsert_node(sym_id, sym_label, {
+                "name":         sym_name,
+                "filePath":     sym.get("filePath", ""),
+                "lineNumber":   sym.get("lineNumber", 0),
+                "language":     sym.get("language", "python"),
+                "repositoryId": repo_id,
+            })
+            nodes_created += 1
+
+            # Link symbol to its repository
+            if await _node_exists(repo_id):
+                await _add_relationship(sym_id, repo_id, "BELONGS_TO")
+                rels_created += 1
+
+        # Upsert CALLS / IMPLEMENTS edges
+        for rel in relations:
+            from_name  = rel.get("fromSymbol", "")
+            to_name    = rel.get("toSymbol", "")
+            rel_type   = rel.get("relationType", "CALLS")
+            file_path  = rel.get("filePath", "")
+            from_id    = f"{repo_id}:{file_path}:{from_name}"
+            # to_id is best-effort: same file first, then bare name
+            to_id      = f"{repo_id}:{file_path}:{to_name}"
+
+            if rel_type in ("CALLS", "IMPLEMENTS"):
+                if await _node_exists(from_id) and await _node_exists(to_id):
+                    await _add_relationship(from_id, to_id, rel_type)
+                    rels_created += 1
+
+        logger.info(
+            "Graph: ArchitectureAnalyzed for %s — %d symbols, %d relations",
+            repo_id, len(symbols), len(relations),
         )
 
     else:
@@ -1064,3 +1111,164 @@ async def repository_timeline(
         "eventType":    event_type,
         "generatedAt":  _now_iso(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Architecture Analysis helpers
+# ---------------------------------------------------------------------------
+
+def _mem_architecture_analysis(repo_id: str) -> dict:
+    """Analyse architecture in in-memory mode."""
+    # Collect all Function/Class nodes belonging to this repo
+    functions = []
+    classes = []
+    for node in _nodes.values():
+        props = node.get("properties", {})
+        if props.get("repositoryId") != repo_id:
+            continue
+        if node["label"] == "Function":
+            functions.append(node)
+        elif node["label"] == "Class":
+            classes.append(node)
+
+    if not functions and not classes:
+        return {
+            "repositoryId":       repo_id,
+            "totalFunctions":     0,
+            "totalClasses":       0,
+            "totalSymbols":       0,
+            "languageBreakdown":  {},
+            "topCalledFunctions": [],
+            "circularCalls":      [],
+            "analyzedAt":         _now_iso(),
+        }
+
+    # In-degree (CALLS edges) per node
+    calls_in: dict[str, int] = {}
+    for rel in _relationships:
+        if rel["type"] == "CALLS":
+            calls_in[rel["to"]] = calls_in.get(rel["to"], 0) + 1
+
+    # Top called (potential god-objects)
+    top_called = sorted(
+        [
+            {
+                "name":    n.get("properties", {}).get("name", n["nodeId"]),
+                "nodeId":  n["nodeId"],
+                "inDegree": calls_in.get(n["nodeId"], 0),
+                "filePath": n.get("properties", {}).get("filePath", ""),
+            }
+            for n in functions
+        ],
+        key=lambda x: -x["inDegree"],
+    )[:10]
+
+    # Language breakdown
+    lang_counts: dict[str, int] = {}
+    for n in functions + classes:
+        lang = n.get("properties", {}).get("language", "unknown")
+        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+    # Circular calls: simplified — detect if any node calls itself via chain
+    # (full cycle detection is too expensive for in-memory; just detect direct self-calls)
+    self_calls = [
+        r["to"] for r in _relationships
+        if r["type"] == "CALLS" and r["from"] == r["to"]
+    ]
+
+    return {
+        "repositoryId":       repo_id,
+        "totalFunctions":     len(functions),
+        "totalClasses":       len(classes),
+        "totalSymbols":       len(functions) + len(classes),
+        "languageBreakdown":  lang_counts,
+        "topCalledFunctions": top_called,
+        "circularCalls":      self_calls,
+        "analyzedAt":         _now_iso(),
+    }
+
+
+async def _neo4j_architecture_analysis(repo_id: str) -> dict:
+    """Analyse architecture using Neo4j Cypher."""
+    async with _driver.session() as session:
+        # Symbol counts
+        r1 = await session.run(
+            """
+            MATCH (n {repositoryId: $repoId})
+            WHERE n:Function OR n:Class
+            RETURN labels(n)[0] AS label, count(n) AS cnt
+            """,
+            repoId=repo_id,
+        )
+        label_rows = await r1.data()
+
+    counts = {row["label"]: row["cnt"] for row in label_rows}
+    total_functions = counts.get("Function", 0)
+    total_classes   = counts.get("Class", 0)
+
+    async with _driver.session() as session:
+        # Top called functions by in-degree
+        r2 = await session.run(
+            """
+            MATCH (caller)-[:CALLS]->(f:Function {repositoryId: $repoId})
+            WITH f, count(caller) AS inDegree
+            RETURN f.name AS name, f.nodeId AS nodeId,
+                   f.filePath AS filePath, inDegree
+            ORDER BY inDegree DESC LIMIT 10
+            """,
+            repoId=repo_id,
+        )
+        top_rows = await r2.data()
+
+    top_called = [
+        {"name": r["name"], "nodeId": r["nodeId"],
+         "filePath": r["filePath"], "inDegree": r["inDegree"]}
+        for r in top_rows
+    ]
+
+    async with _driver.session() as session:
+        # Language breakdown
+        r3 = await session.run(
+            """
+            MATCH (n {repositoryId: $repoId})
+            WHERE n:Function OR n:Class
+            RETURN n.language AS language, count(n) AS cnt
+            """,
+            repoId=repo_id,
+        )
+        lang_rows = await r3.data()
+
+    lang_counts = {(r["language"] or "unknown"): r["cnt"] for r in lang_rows}
+
+    return {
+        "repositoryId":       repo_id,
+        "totalFunctions":     total_functions,
+        "totalClasses":       total_classes,
+        "totalSymbols":       total_functions + total_classes,
+        "languageBreakdown":  lang_counts,
+        "topCalledFunctions": top_called,
+        "circularCalls":      [],   # Full cycle detection → Phase 3
+        "analyzedAt":         _now_iso(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Architecture Analysis endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/analysis/architecture/{repo_id}", tags=["Analysis"])
+async def analyze_architecture(repo_id: str):
+    """Return architecture health metrics for a repository.
+
+    Includes function/class counts, top-called functions (potential god-objects),
+    language distribution, and basic circular call detection.
+    """
+    if not await _node_exists(repo_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{repo_id}' not found in graph.",
+        )
+
+    if _driver:
+        return await _neo4j_architecture_analysis(repo_id)
+    return _mem_architecture_analysis(repo_id)

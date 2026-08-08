@@ -41,9 +41,12 @@ from shared.models import (
     DependencyDetectedPayload,
     RepositoryClonedPayload,
     RepositoryCloneFailedPayload,
+    ArchitectureAnalyzedPayload,
+    CodeSymbol,
+    CodeRelation,
     create_event,
 )
-from parsers import python_parser, node_parser, go_parser, rust_parser
+from parsers import python_parser, node_parser, go_parser, rust_parser, ast_python, ast_javascript
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s"
@@ -191,7 +194,65 @@ async def _clone_and_analyze(repo_id: str, url: str, org_id: str, branch: str = 
         published_commits, len(commits), repo_id,
     )
 
-    # ── Cleanup ─────────────────────────────────────────────────────────────
+    # ── Architecture Analysis (AST) ─────────────────────────────────────────
+    arch_symbols: list  = []
+    arch_relations: list = []
+    files_analyzed = 0
+
+    try:
+        py_syms, py_rels = ast_python.parse_directory(root)
+        arch_symbols.extend(py_syms)
+        arch_relations.extend(py_rels)
+        py_files = sum(1 for _ in root.rglob("*.py"))
+        files_analyzed += py_files
+        logger.info("AST Python: %d symbols, %d relations (%d files)",
+                    len(py_syms), len(py_rels), py_files)
+    except Exception as exc:
+        logger.warning("AST Python analysis failed: %s", exc)
+
+    try:
+        js_syms, js_rels = ast_javascript.parse_directory(root)
+        arch_symbols.extend(js_syms)
+        arch_relations.extend(js_rels)
+        js_files = sum(
+            1 for p in root.rglob("*")
+            if p.suffix in (".js", ".ts", ".jsx", ".tsx")
+        )
+        files_analyzed += js_files
+        logger.info("AST JavaScript: %d symbols, %d relations (%d files)",
+                    len(js_syms), len(js_rels), js_files)
+    except Exception as exc:
+        logger.warning("AST JavaScript analysis failed: %s", exc)
+
+    if arch_symbols or arch_relations:
+        # Deduplicate relations (same from/to/type)
+        seen_rels: set = set()
+        unique_rels = []
+        for r in arch_relations:
+            key = (r["fromSymbol"], r["toSymbol"], r["relationType"])
+            if key not in seen_rels:
+                seen_rels.add(key)
+                unique_rels.append(r)
+
+        arch_payload = ArchitectureAnalyzedPayload(
+            repositoryId=repo_id,
+            language="multi",
+            symbols=[CodeSymbol(**s) for s in arch_symbols[:2000]],
+            relations=[CodeRelation(**r) for r in unique_rels[:5000]],
+            filesAnalyzed=files_analyzed,
+        )
+        await publisher.publish(
+            "architecture.analyzed",
+            create_event("ArchitectureAnalyzed", repo_id, org_id, arch_payload),
+        )
+        logger.info(
+            "ArchitectureAnalyzed published for %s: %d symbols, %d unique relations",
+            repo_id, len(arch_symbols), len(unique_rels),
+        )
+    else:
+        logger.info("No code symbols found for %s — skipping ArchitectureAnalyzed", repo_id)
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     shutil.rmtree(clone_dir, ignore_errors=True)
     logger.info("Cleaned up clone dir: %s", clone_dir)
 

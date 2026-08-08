@@ -199,6 +199,47 @@ class SearchIndexedPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.3 — Architecture Analyzer Payloads
+# ---------------------------------------------------------------------------
+
+class CodeSymbol(BaseModel):
+    """A function or class found in source code via AST/static analysis."""
+    name: str                                           # qualified: "ClassName.method"
+    symbol_type: str = Field(..., alias="symbolType")  # "function" | "class"
+    file_path: str = Field(..., alias="filePath")      # relative to repo root
+    line_number: int = Field(default=0, alias="lineNumber")
+    language: str = "python"                           # "python" | "javascript"
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CodeRelation(BaseModel):
+    """A directed relationship between two code symbols."""
+    from_symbol: str = Field(..., alias="fromSymbol")  # qualified name
+    to_symbol: str = Field(..., alias="toSymbol")
+    relation_type: str = Field(..., alias="relationType")  # "CALLS" | "IMPLEMENTS"
+    file_path: str = Field(..., alias="filePath")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ArchitectureAnalyzedPayload(BaseModel):
+    """Published by git-analyzer-service after AST analysis of a repository.
+
+    symbols    — every function/class found in the codebase
+    relations  — CALLS and IMPLEMENTS edges between symbols
+    """
+    repository_id: str = Field(..., alias="repositoryId")
+    language: str = "multi"                             # "python" | "javascript" | "multi"
+    symbols: List[CodeSymbol] = Field(default_factory=list)
+    relations: List[CodeRelation] = Field(default_factory=list)
+    files_analyzed: int = Field(default=0, alias="filesAnalyzed")
+    analyzed_at: datetime = Field(default_factory=datetime.utcnow, alias="analyzedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
 # Factory helper
 # ---------------------------------------------------------------------------
 
