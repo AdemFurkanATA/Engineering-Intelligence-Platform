@@ -31,13 +31,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SERVICES: Dict[str, str] = {
-    "auth":       os.getenv("AUTH_SERVICE_URL",       "http://localhost:8001"),
-    "repository": os.getenv("REPOSITORY_SERVICE_URL", "http://localhost:8002"),
-    "document":   os.getenv("DOCUMENT_SERVICE_URL",   "http://localhost:8003"),
-    "embedding":  os.getenv("EMBEDDING_SERVICE_URL",  "http://localhost:8004"),
-    "graph":      os.getenv("GRAPH_SERVICE_URL",      "http://localhost:8005"),
-    "search":     os.getenv("SEARCH_SERVICE_URL",     "http://localhost:8006"),
-    "event":      os.getenv("EVENT_SERVICE_URL",      "http://localhost:8007"),
+    "auth":         os.getenv("AUTH_SERVICE_URL",         "http://localhost:8001"),
+    "repository":   os.getenv("REPOSITORY_SERVICE_URL",   "http://localhost:8002"),
+    "document":     os.getenv("DOCUMENT_SERVICE_URL",     "http://localhost:8003"),
+    "embedding":    os.getenv("EMBEDDING_SERVICE_URL",    "http://localhost:8004"),
+    "graph":        os.getenv("GRAPH_SERVICE_URL",        "http://localhost:8005"),
+    "search":       os.getenv("SEARCH_SERVICE_URL",       "http://localhost:8006"),
+    "event":        os.getenv("EVENT_SERVICE_URL",        "http://localhost:8007"),
+    # Phase 2 — clones repos, runs AST analysis, publishes dependency/commit events
+    "git-analyzer": os.getenv("GIT_ANALYZER_SERVICE_URL", "http://localhost:8008"),
 }
 
 # ---------------------------------------------------------------------------

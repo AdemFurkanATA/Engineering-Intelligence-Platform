@@ -1,4 +1,4 @@
-﻿"""
+"""
 parsers/python_parser.py
 
 Detects Python dependencies from:
@@ -100,22 +100,45 @@ def parse_setup_py(content: str) -> List[dict]:
     return deps
 
 
+
 def parse_directory(root: Path) -> List[dict]:
-    """Scan a repo directory and parse all Python dependency files."""
+    """Scan a repo directory and parse all Python dependency files.
+
+    Skips common virtual-environment and build directories to avoid
+    ingesting third-party packages as project dependencies.
+    """
+    _SKIP_DIRS = frozenset({
+        ".venv", "venv", "env", ".env",
+        "node_modules", "site-packages",
+        "dist", "build", ".tox", ".eggs", "eggs",
+        "__pycache__", ".git",
+    })
+
+    def _skip(path: Path) -> bool:
+        """Return True if path is inside a directory that should be ignored."""
+        return any(part in _SKIP_DIRS for part in path.parts)
+
     deps: List[dict] = []
     for path in root.rglob("requirements*.txt"):
+        if _skip(path):
+            continue
         try:
             deps.extend(parse_requirements_txt(path.read_text(errors="replace")))
         except OSError:
             pass
     for path in root.rglob("pyproject.toml"):
+        if _skip(path):
+            continue
         try:
             deps.extend(parse_pyproject_toml(path.read_text(errors="replace")))
         except OSError:
             pass
     for path in root.rglob("setup.py"):
+        if _skip(path):
+            continue
         try:
             deps.extend(parse_setup_py(path.read_text(errors="replace")))
         except OSError:
             pass
     return deps
+

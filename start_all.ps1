@@ -8,14 +8,15 @@ $py   = "python"  # adjust if python is not in PATH (e.g. "python3" or full path
 $env:PYTHONPATH = "$root\src"
 
 $services = @(
-    @{ name = "api-gateway";        port = 8000 },
-    @{ name = "auth-service";       port = 8001 },
-    @{ name = "repository-service"; port = 8002 },
-    @{ name = "document-service";   port = 8003 },
-    @{ name = "embedding-service";  port = 8004 },
-    @{ name = "graph-service";      port = 8005 },
-    @{ name = "search-service";     port = 8006 },
-    @{ name = "event-service";      port = 8007 }
+    @{ name = "api-gateway";          port = 8000 },
+    @{ name = "auth-service";         port = 8001 },
+    @{ name = "repository-service";   port = 8002 },
+    @{ name = "document-service";     port = 8003 },
+    @{ name = "embedding-service";    port = 8004 },
+    @{ name = "graph-service";        port = 8005 },
+    @{ name = "search-service";       port = 8006 },
+    @{ name = "event-service";        port = 8007 },
+    @{ name = "git-analyzer-service"; port = 8008 }   # Phase 2
 )
 
 Write-Host "Starting Engineering Intelligence Platform services..." -ForegroundColor Cyan

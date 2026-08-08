@@ -71,6 +71,42 @@ TOPIC_CATALOG = [
         "consumers": [],
         "description": "Published after the knowledge graph is updated.",
     },
+    # ── Phase 2 topics ───────────────────────────────────────────────────────
+    {
+        "topic": "repository.cloned",
+        "eventType": "RepositoryCloned",
+        "producer": "git-analyzer-service",
+        "consumers": ["graph-service"],
+        "description": "Published after a repository is successfully cloned.",
+    },
+    {
+        "topic": "repository.clone_failed",
+        "eventType": "RepositoryCloneFailed",
+        "producer": "git-analyzer-service",
+        "consumers": ["graph-service"],
+        "description": "Published when a repository clone attempt fails.",
+    },
+    {
+        "topic": "dependency.detected",
+        "eventType": "DependencyDetected",
+        "producer": "git-analyzer-service",
+        "consumers": ["graph-service"],
+        "description": "Published for each dependency found in the cloned repository.",
+    },
+    {
+        "topic": "commit.analyzed",
+        "eventType": "CommitAnalyzed",
+        "producer": "git-analyzer-service",
+        "consumers": ["graph-service"],
+        "description": "Published for each commit found during repository analysis.",
+    },
+    {
+        "topic": "architecture.analyzed",
+        "eventType": "ArchitectureAnalyzed",
+        "producer": "git-analyzer-service",
+        "consumers": ["graph-service"],
+        "description": "Published after AST-based symbol/relation extraction (Phase 2.3).",
+    },
 ]
 
 # In-memory event log (last 1000 events, FIFO)

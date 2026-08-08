@@ -20,6 +20,7 @@ Configuration (env vars):
     GIT_CLONE_DIR          str   default /tmp/eip-clones
     KAFKA_BOOTSTRAP_SERVERS str  default localhost:9092
 """
+import asyncio
 import logging
 import os
 import shutil
@@ -79,7 +80,7 @@ def _now_iso() -> str:
 
 
 async def _clone_and_analyze(repo_id: str, url: str, org_id: str, branch: str = "main") -> None:
-    """Clone the repository, run all parsers, publish events. Cleans up on exit."""
+    """Clone the repository, run all parsers, publish events. Always cleans up on exit."""
     clone_dir = os.path.join(GIT_CLONE_BASE_DIR, f"eip-{repo_id}")
     try:
         import git as gitpython
@@ -99,14 +100,18 @@ async def _clone_and_analyze(repo_id: str, url: str, org_id: str, branch: str = 
     if os.path.exists(clone_dir):
         shutil.rmtree(clone_dir, ignore_errors=True)
 
-    logger.info("Cloning %s → %s", url, clone_dir)
+    logger.info("Cloning %s (branch=%s) → %s", url, branch, clone_dir)
     try:
-        repo = gitpython.Repo.clone_from(
-            url, clone_dir,
-            depth=GIT_MAX_COMMITS,           # shallow clone for speed
-            no_single_branch=True,
-            kill_after_timeout=GIT_CLONE_TIMEOUT_SEC,
-        )
+        # Offload blocking git clone to thread pool so event loop stays free
+        def _do_clone():
+            return gitpython.Repo.clone_from(
+                url, clone_dir,
+                branch=branch,                          # ← honour branch param
+                depth=GIT_MAX_COMMITS,                  # shallow clone for speed
+                no_single_branch=True,
+                kill_after_timeout=GIT_CLONE_TIMEOUT_SEC,
+            )
+        repo = await asyncio.to_thread(_do_clone)
     except Exception as exc:
         error_msg = str(exc)[:500]  # truncate long stack traces
         logger.error("Clone failed for %s: %s", url, error_msg)
@@ -119,142 +124,147 @@ async def _clone_and_analyze(repo_id: str, url: str, org_id: str, branch: str = 
         )
         return
 
-    root = Path(clone_dir)
-
-    # Count commits (shallow clone may differ from actual total)
     try:
-        commits = list(repo.iter_commits(max_count=GIT_MAX_COMMITS))
-    except Exception:
-        commits = []
+        root = Path(clone_dir)
 
-    # ── Publish RepositoryCloned ───────────────────────────────────────────
-    size_kb = sum(f.stat().st_size for f in root.rglob("*") if f.is_file()) // 1024
-    cloned_payload = RepositoryClonedPayload(
-        repositoryId=repo_id,
-        url=url,
-        defaultBranch=branch,
-        commitCount=len(commits),
-        sizeKb=size_kb,
-    )
-    await publisher.publish(
-        "repository.cloned",
-        create_event("RepositoryCloned", repo_id, org_id, cloned_payload),
-    )
-    logger.info("RepositoryCloned published for %s (%d commits, %d KB)", repo_id, len(commits), size_kb)
+        # Count commits — offload stats read (may touch many objects)
+        def _collect_commits():
+            try:
+                raw = list(repo.iter_commits(max_count=GIT_MAX_COMMITS))
+            except Exception:
+                return []
+            result = []
+            for c in raw:
+                try:
+                    result.append({
+                        "sha":          c.hexsha,
+                        "message":      (c.message or "").strip()[:500],
+                        "author_email": c.author.email or "",
+                        "author_name":  c.author.name or "",
+                        "committed_at": datetime.fromtimestamp(
+                                            c.committed_date, tz=timezone.utc),
+                        "files_changed": list(c.stats.files.keys())[:50],
+                    })
+                except Exception as e:
+                    logger.warning("Skipping commit %s: %s", getattr(c, "hexsha", "?"), e)
+            return result
 
-    # ── Dependency Detection ────────────────────────────────────────────────
-    all_deps = []
-    all_deps.extend(python_parser.parse_directory(root))
-    all_deps.extend(node_parser.parse_directory(root))
-    all_deps.extend(go_parser.parse_directory(root))
-    all_deps.extend(rust_parser.parse_directory(root))
+        commits = await asyncio.to_thread(_collect_commits)
 
-    logger.info("Found %d dependencies in %s", len(all_deps), repo_id)
-    for dep in all_deps:
-        dep_payload = DependencyDetectedPayload(
+        # ── Publish RepositoryCloned ─────────────────────────────────────────
+        size_kb = sum(f.stat().st_size for f in root.rglob("*") if f.is_file()) // 1024
+        cloned_payload = RepositoryClonedPayload(
             repositoryId=repo_id,
-            name=dep["name"],
-            version=dep.get("version", ""),
-            ecosystem=dep.get("ecosystem", "unknown"),
-            sourceFile=dep.get("sourceFile", ""),
+            url=url,
+            defaultBranch=branch,
+            commitCount=len(commits),
+            sizeKb=size_kb,
         )
         await publisher.publish(
-            "dependency.detected",
-            create_event("DependencyDetected", repo_id, org_id, dep_payload),
+            "repository.cloned",
+            create_event("RepositoryCloned", repo_id, org_id, cloned_payload),
         )
+        logger.info("RepositoryCloned published for %s (%d commits, %d KB)",
+                    repo_id, len(commits), size_kb)
 
-    # ── Commit Analysis ─────────────────────────────────────────────────────
-    published_commits = 0
-    for commit in commits:
-        try:
-            committed_dt = datetime.fromtimestamp(
-                commit.committed_date, tz=timezone.utc
+        # ── Dependency Detection ─────────────────────────────────────────────
+        def _parse_deps():
+            deps = []
+            deps.extend(python_parser.parse_directory(root))
+            deps.extend(node_parser.parse_directory(root))
+            deps.extend(go_parser.parse_directory(root))
+            deps.extend(rust_parser.parse_directory(root))
+            return deps
+
+        all_deps = await asyncio.to_thread(_parse_deps)
+        logger.info("Found %d dependencies in %s", len(all_deps), repo_id)
+        for dep in all_deps:
+            dep_payload = DependencyDetectedPayload(
+                repositoryId=repo_id,
+                name=dep["name"],
+                version=dep.get("version", ""),
+                ecosystem=dep.get("ecosystem", "unknown"),
+                sourceFile=dep.get("sourceFile", ""),
             )
-            files_changed = list(commit.stats.files.keys())[:50]  # cap per commit
+            await publisher.publish(
+                "dependency.detected",
+                create_event("DependencyDetected", repo_id, org_id, dep_payload),
+            )
 
+        # ── Commit Analysis ──────────────────────────────────────────────────
+        published_commits = 0
+        for commit in commits:
             commit_payload = CommitAnalyzedPayload(
                 repositoryId=repo_id,
-                sha=commit.hexsha,
-                authorEmail=commit.author.email or "",
-                authorName=commit.author.name or "",
-                message=(commit.message or "").strip()[:500],
-                filesChanged=files_changed,
-                committedAt=committed_dt,
+                sha=commit["sha"],
+                authorEmail=commit["author_email"],
+                authorName=commit["author_name"],
+                message=commit["message"],
+                filesChanged=commit["files_changed"],
+                committedAt=commit["committed_at"],
             )
             await publisher.publish(
                 "commit.analyzed",
-                create_event("CommitAnalyzed", commit.hexsha, org_id, commit_payload),
+                create_event("CommitAnalyzed", commit["sha"], org_id, commit_payload),
             )
             published_commits += 1
-        except Exception as exc:
-            logger.warning("Skipping commit %s: %s", getattr(commit, "hexsha", "?"), exc)
 
-    logger.info(
-        "CommitAnalyzed: published %d/%d commits for %s",
-        published_commits, len(commits), repo_id,
-    )
-
-    # ── Architecture Analysis (AST) ─────────────────────────────────────────
-    arch_symbols: list  = []
-    arch_relations: list = []
-    files_analyzed = 0
-
-    try:
-        py_syms, py_rels = ast_python.parse_directory(root)
-        arch_symbols.extend(py_syms)
-        arch_relations.extend(py_rels)
-        py_files = sum(1 for _ in root.rglob("*.py"))
-        files_analyzed += py_files
-        logger.info("AST Python: %d symbols, %d relations (%d files)",
-                    len(py_syms), len(py_rels), py_files)
-    except Exception as exc:
-        logger.warning("AST Python analysis failed: %s", exc)
-
-    try:
-        js_syms, js_rels = ast_javascript.parse_directory(root)
-        arch_symbols.extend(js_syms)
-        arch_relations.extend(js_rels)
-        js_files = sum(
-            1 for p in root.rglob("*")
-            if p.suffix in (".js", ".ts", ".jsx", ".tsx")
-        )
-        files_analyzed += js_files
-        logger.info("AST JavaScript: %d symbols, %d relations (%d files)",
-                    len(js_syms), len(js_rels), js_files)
-    except Exception as exc:
-        logger.warning("AST JavaScript analysis failed: %s", exc)
-
-    if arch_symbols or arch_relations:
-        # Deduplicate relations (same from/to/type)
-        seen_rels: set = set()
-        unique_rels = []
-        for r in arch_relations:
-            key = (r["fromSymbol"], r["toSymbol"], r["relationType"])
-            if key not in seen_rels:
-                seen_rels.add(key)
-                unique_rels.append(r)
-
-        arch_payload = ArchitectureAnalyzedPayload(
-            repositoryId=repo_id,
-            language="multi",
-            symbols=[CodeSymbol(**s) for s in arch_symbols[:2000]],
-            relations=[CodeRelation(**r) for r in unique_rels[:5000]],
-            filesAnalyzed=files_analyzed,
-        )
-        await publisher.publish(
-            "architecture.analyzed",
-            create_event("ArchitectureAnalyzed", repo_id, org_id, arch_payload),
-        )
         logger.info(
-            "ArchitectureAnalyzed published for %s: %d symbols, %d unique relations",
-            repo_id, len(arch_symbols), len(unique_rels),
+            "CommitAnalyzed: published %d/%d commits for %s",
+            published_commits, len(commits), repo_id,
         )
-    else:
-        logger.info("No code symbols found for %s — skipping ArchitectureAnalyzed", repo_id)
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    shutil.rmtree(clone_dir, ignore_errors=True)
-    logger.info("Cleaned up clone dir: %s", clone_dir)
+        # ── Architecture Analysis (AST) ──────────────────────────────────────
+        def _parse_ast():
+            arch_symbols, arch_relations = [], []
+            py_syms, py_rels = ast_python.parse_directory(root)
+            arch_symbols.extend(py_syms); arch_relations.extend(py_rels)
+            js_syms, js_rels = ast_javascript.parse_directory(root)
+            arch_symbols.extend(js_syms); arch_relations.extend(js_rels)
+            py_files = sum(1 for _ in root.rglob("*.py"))
+            js_files = sum(1 for p in root.rglob("*")
+                          if p.suffix in (".js", ".ts", ".jsx", ".tsx"))
+            return arch_symbols, arch_relations, py_files + js_files
+
+        try:
+            arch_symbols, arch_relations, files_analyzed = await asyncio.to_thread(_parse_ast)
+            logger.info("AST: %d symbols, %d relations across %d files",
+                        len(arch_symbols), len(arch_relations), files_analyzed)
+        except Exception as exc:
+            logger.warning("AST analysis failed for %s: %s", repo_id, exc)
+            arch_symbols, arch_relations, files_analyzed = [], [], 0
+
+        if arch_symbols or arch_relations:
+            seen_rels: set = set()
+            unique_rels = []
+            for r in arch_relations:
+                key = (r["fromSymbol"], r["toSymbol"], r["relationType"])
+                if key not in seen_rels:
+                    seen_rels.add(key)
+                    unique_rels.append(r)
+
+            arch_payload = ArchitectureAnalyzedPayload(
+                repositoryId=repo_id,
+                language="multi",
+                symbols=[CodeSymbol(**s) for s in arch_symbols[:2000]],
+                relations=[CodeRelation(**r) for r in unique_rels[:5000]],
+                filesAnalyzed=files_analyzed,
+            )
+            await publisher.publish(
+                "architecture.analyzed",
+                create_event("ArchitectureAnalyzed", repo_id, org_id, arch_payload),
+            )
+            logger.info(
+                "ArchitectureAnalyzed published for %s: %d symbols, %d unique relations",
+                repo_id, len(arch_symbols), len(unique_rels),
+            )
+        else:
+            logger.info("No code symbols found for %s — skipping ArchitectureAnalyzed", repo_id)
+
+    finally:
+        # Always remove the clone dir — even if an exception occurs above
+        shutil.rmtree(clone_dir, ignore_errors=True)
+        logger.info("Cleaned up clone dir: %s", clone_dir)
 
 
 # ---------------------------------------------------------------------------
