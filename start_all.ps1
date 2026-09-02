@@ -1,6 +1,8 @@
 # start_all.ps1 — Start all Engineering Intelligence Platform microservices locally
 # Usage: .\start_all.ps1
 # Requires: Python 3.8+ and dependencies from requirements.txt installed.
+# Phase 2 services: git-analyzer-service (:8008)
+# Phase 3 services: goal-service (:8009)
 
 $root = $PSScriptRoot
 $py   = "python"  # adjust if python is not in PATH (e.g. "python3" or full path)
@@ -16,7 +18,8 @@ $services = @(
     @{ name = "graph-service";        port = 8005 },
     @{ name = "search-service";       port = 8006 },
     @{ name = "event-service";        port = 8007 },
-    @{ name = "git-analyzer-service"; port = 8008 }   # Phase 2
+    @{ name = "git-analyzer-service"; port = 8008 },  # Phase 2
+    @{ name = "goal-service";         port = 8009 }   # Phase 3
 )
 
 Write-Host "Starting Engineering Intelligence Platform services..." -ForegroundColor Cyan

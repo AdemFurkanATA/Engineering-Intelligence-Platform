@@ -467,6 +467,8 @@ At the end of Phase 2 the platform should
 
 # Phase 3 — Autonomous Engineering Intelligence
 
+**Status: 🔵 In Progress — Goal Service MVP (Phase 3.0 Stabilization)**
+
 ## Objective
 
 Transform the platform into an active engineering assistant capable of reasoning, planning and improving the software ecosystem.
@@ -474,6 +476,18 @@ Transform the platform into an active engineering assistant capable of reasoning
 The platform should no longer wait for questions.
 
 It should proactively discover problems and recommend improvements.
+
+### Phase 3 Milestones
+
+| Milestone | Status | Description |
+|---|---|---|
+| **3.0 Stabilization** | 🔵 In Progress | Goal API, rule-based Planner, Report Engine; all tests green |
+| **3.1 Goal MVP** | 📋 Planned | PostgreSQL persistence, entity targeting, 404/no-data model |
+| **3.2 Reliable Orchestration** | 📋 Planned | Retry, parallel steps, idempotency, audit trail |
+| **3.3 Report Quality** | 📋 Planned | Evidence links, confidence scores, dedup, recommendation ranking |
+| **3.4 LLM-backed Planner** | 📋 Planned | Structured-output LLM planner (deterministic fallback stays) |
+| **3.5 Proactive Intelligence** | 📋 Planned | Scheduled scans, risk-change alerts, dashboard, notifications |
+| **3.6 Controlled Automation** | 📋 Planned | Human-approved PR comments, not direct code changes |
 
 ---
 

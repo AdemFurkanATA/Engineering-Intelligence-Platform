@@ -40,6 +40,8 @@ SERVICES: Dict[str, str] = {
     "event":        os.getenv("EVENT_SERVICE_URL",        "http://localhost:8007"),
     # Phase 2 — clones repos, runs AST analysis, publishes dependency/commit events
     "git-analyzer": os.getenv("GIT_ANALYZER_SERVICE_URL", "http://localhost:8008"),
+    # Phase 3 — Goal API, rule-based Planner, Report Engine
+    "goal":         os.getenv("GOAL_SERVICE_URL",         "http://localhost:8009"),
 }
 
 # ---------------------------------------------------------------------------

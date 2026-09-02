@@ -3174,21 +3174,112 @@ Human Review (if required)
 Completion
 ```
 
-The execution process remains transparent while shielding clients from implementation details.
+# 14.6 Goal Endpoints — Phase 3.0 Implementation
+
+**Service:** `goal-service` · Port `:8009` · Gateway prefix: `/api/v1/goal/`  
+**Direct access:** `http://localhost:8009`
+
+| Method | Endpoint | Status | Description |
+|---------|----------|--------|-------------|
+| POST | `/goals` | ✅ Implemented | Submit engineering goal (202 Accepted) |
+| GET | `/goals` | ✅ Implemented | List goals (filter by status, goalType, repositoryId) |
+| GET | `/goals/{goalId}` | ✅ Implemented | Full goal record with plan step results |
+| GET | `/goals/{goalId}/report` | ✅ Implemented | Structured engineering report only |
+| DELETE | `/goals/{goalId}` | ✅ Implemented | Cancel running goal (returns previousStatus) |
+| GET | `/health` | ✅ Implemented | Health check |
+
+### POST /goals — Request Body
+
+```json
+{
+  "goal":           "Bu repository'de en riskli modülleri bul.",
+  "repositoryId":   "my-service",
+  "organizationId": "org-001",
+  "entityType":     "service",
+  "entityId":       "PaymentService",
+  "changeScope":    "Remove the processRefund method"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `goal` | ✅ | Natural-language engineering goal (min 5 chars) |
+| `repositoryId` | Recommended | Target repository node ID |
+| `organizationId` | Optional | Organization ID for cross-repo goals |
+| `entityType` | Optional | `service` \| `module` \| `class` \| `function` |
+| `entityId` | Optional | Graph node ID of targeted entity (impact analysis) |
+| `changeScope` | Optional | Plain-text description of planned change |
+
+### POST /goals — Response 202
+
+```json
+{
+  "goalId":      "abc-123",
+  "status":      "submitted",
+  "submittedAt": "2026-09-01T18:00:00Z",
+  "message":     "Goal accepted and queued for execution."
+}
+```
+
+### Goal Lifecycle
+
+```
+submitted → planning → executing → completed
+                                 ↘ failed
+                                 ↘ cancelled
+```
+
+### GET /goals/{goalId}/report — Response 200
+
+```json
+{
+  "goal_id":         "abc-123",
+  "goal_type":       "risk_analysis",
+  "repository_id":   "my-service",
+  "organization_id": "org-001",
+  "summary":         "Risk analysis complete. 3 violations detected...",
+  "severity":        "high",
+  "findings": [
+    {
+      "category":    "architectural_violation",
+      "title":       "God Class",
+      "description": "Too many methods",
+      "severity":    "high",
+      "evidence":    ["node-id-123"],
+      "node_id":     "node-id-123"
+    }
+  ],
+  "recommendations": [
+    {
+      "title":       "Resolve architectural violations",
+      "description": "3 violation(s) detected. Address god-classes first.",
+      "priority":    "high",
+      "action":      "Refactor violating nodes"
+    }
+  ],
+  "data_points":  { "violations": {...}, "dependencyMetrics": {...} },
+  "generated_at": "2026-09-01T18:00:05Z",
+  "execution_ms": 342
+}
+```
+
+**Error responses:**
+- `409 Conflict` — goal still executing; report not ready
+- `404 Not Found` — goal ID not found
+- Goal `status=failed` + `error` field — required step returned 404 (repo not synced)
+
+### DELETE /goals/{goalId} — Response 200
+
+```json
+{
+  "goalId":         "abc-123",
+  "cancelled":      true,
+  "previousStatus": "executing",
+  "currentStatus":  "cancelled"
+}
+```
 
 ---
-
-# 14.6 Goal Endpoints
-
-| Method | Endpoint | Description |
-|---------|----------|-------------|
-| POST | `/api/v1/goals` | Submit engineering goal |
-| GET | `/api/v1/goals` | List submitted goals |
-| GET | `/api/v1/goals/{id}` | Retrieve goal |
-| GET | `/api/v1/goals/{id}/status` | Goal execution status |
-| GET | `/api/v1/goals/{id}/result` | Goal result |
-| POST | `/api/v1/goals/{id}/cancel` | Cancel goal |
-| POST | `/api/v1/goals/{id}/retry` | Retry goal |
 
 Goal execution is asynchronous by default.
 
