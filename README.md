@@ -1,6 +1,6 @@
 # Engineering Intelligence Platform
 
-> **Phase 1 — Living Knowledge** | Event-Driven · Knowledge Graph · Autonomous Engineering Intelligence
+> **Phase 2 — Engineering Intelligence ✅** | Phase 3: Goal API + Planner + Report Engine 🔵
 
 Engineering Intelligence Platform is a goal-oriented platform that continuously transforms repositories, documentation, and engineering artifacts into an **evolving organizational knowledge graph** — capable of supporting autonomous engineering intelligence.
 
@@ -49,7 +49,20 @@ While most tools help engineers write code, this platform helps engineering orga
 | Redis       | Caching & rate limiting        | 6379  |
 | Kafka       | Event streaming                | 9092  |
 
----
+### Services
+| Service | Port | Phase | Responsibility |
+|---|---|---|---|
+| api-gateway | :8000 | 1 | Reverse proxy, rate limiting, routing |
+| auth-service | :8001 | 1 | JWT auth, users, roles |
+| repository-service | :8002 | 1 | Repository CRUD + RepositoryCreated events |
+| document-service | :8003 | 1 | Document ingestion + chunking |
+| embedding-service | :8004 | 1 | Vector embeddings (all-MiniLM-L6-v2 + Qdrant) |
+| graph-service | :8005 | 1+2 | Knowledge Graph + analysis endpoints |
+| search-service | :8006 | 1 | Hybrid search (TF-IDF + Trie + Levenshtein) |
+| event-service | :8007 | 1 | Event catalog + Kafka observability |
+| git-analyzer-service | :8008 | **2** | Git clone, commit/dependency/AST analysis |
+| goal-service | :8009 | **3** | Goal API + rule-based Planner + Report Engine |
+
 
 ## Search Engine — Technical Implementation
 
@@ -400,13 +413,17 @@ POST /repositories
 ## Project Structure
 
 ```
-├── docs/                     # Architecture documentation
+├── docs/                     # Architecture & release documentation
 │   ├── phases.md             # Development roadmap
+│   ├── PHASE2_RELEASE.md     # Phase 2 MVP release notes
+│   ├── PHASE_2_COMPLETION.md # Phase 2 capability checklist
 │   ├── SYSTEM_ARCHITECTURE.md
 │   ├── EVENT_CATALOG.md      # All Kafka event definitions
 │   ├── DATABASE_DESIGN.md
 │   ├── FUNCTIONAL_REQUIREMENTS.md
 │   └── ...
+├── scripts/
+│   └── ops_smoke.sh          # Docker/Kafka/Neo4j integration smoke test
 ├── src/
 │   ├── shared/               # Shared library (models, kafka, config)
 │   │   ├── models.py         # Pydantic event models (EventEnvelope, payloads)
@@ -417,9 +434,14 @@ POST /repositories
 │   ├── repository-service/   # Repository management
 │   ├── document-service/     # Document processing
 │   ├── embedding-service/    # Vector embeddings
-│   ├── graph-service/        # Knowledge Graph
+│   ├── graph-service/        # Knowledge Graph + Phase 2 analysis
 │   ├── search-service/       # Hybrid search
-│   └── event-service/        # Event catalog & observability
+│   ├── event-service/        # Event catalog & observability
+│   ├── git-analyzer-service/ # Phase 2: Git clone + commit/dep/AST analysis
+│   └── goal-service/         # Phase 3: Goal API + Planner + Report Engine
+├── tests/
+│   ├── test_e2e_sync_smoke.py  # E2E integration smoke (real git, in-process)
+│   └── ...                     # 530 unit tests
 ├── docker-compose.yml        # Infrastructure (Kafka, Neo4j, Qdrant, Postgres, Redis)
 ├── Makefile                  # Lifecycle shortcuts (make up, make down)
 ├── requirements.txt          # Python dependencies
@@ -433,62 +455,71 @@ POST /repositories
 | Phase | Name | Status | Key Capability |
 |-------|------|--------|----------------|
 | **Phase 1** | Living Knowledge | ✅ **Complete** | Continuous ingestion, knowledge graph, hybrid search |
-| Phase 2 | Engineering Intelligence | 🔵 Next | Goal API, AI-assisted analysis, workflow automation |
-| Phase 3 | Autonomous Engineering Intelligence | 📋 Planned | Self-improving agents, predictive architecture guidance |
+| **Phase 2** | Engineering Intelligence | ✅ **Complete** | Git analysis, dependency/AST/architecture analysis, decision memory, 530 tests |
+| **Phase 3** | Autonomous Engineering Intelligence | 🔵 **In Progress** | Goal API, rule-based Planner, Report Engine → AI agents |
 
 ---
 
-## Future Direction — Where This Is Going
+## Phase 2 — Engineering Intelligence (Delivered)
 
-Phase 1 establishes the foundation. The platform's true ambition is further:
+Built on top of Phase 1's knowledge graph. Adds the ability to **understand** codebases:
 
 ```
-Phase 1 (Now)            Phase 2                    Phase 3
-─────────────────        ───────────────────────    ─────────────────────────────
-Repositories      →      Goal API               →   Autonomous Agents
-Documentation     →      Planner                →   Self-improving Knowledge
-Knowledge Graph   →      Workflow Orchestration →   Predictive Architecture
-Hybrid Search     →      AI-Assisted Analysis   →   Engineering Intelligence
-Event Streams     →      Recommendations        →   Proactive Guidance
+Phase 1 (Foundation)     Phase 2 (Intelligence)     Phase 3 (Autonomy)
+──────────────────────   ──────────────────────────  ──────────────────────────
+Repositories          →  Git Clone + Analysis     →  Goal API
+Documentation         →  Commit / Dependency      →  Rule-based Planner
+Knowledge Graph       →  AST Symbol Extraction   →  Report Engine
+Hybrid Search         →  Architecture Patterns   →  AI Agents (Phase 3.2)
+Event Streams         →  Violation Detection     →  Self-improving Knowledge
+                         Decision Memory
+                         Impact Analysis
+                         Timeline Engine
 ```
 
-### Goal API (Phase 2)
+### Phase 2 Endpoints (graph-service)
 
-Engineers express intent, the platform executes:
-```
+| Endpoint | Description |
+|---|---|
+| `POST /analyze` | Submit a git repository sync job |
+| `GET /jobs/{id}` | Get job status |
+| `DELETE /jobs/{id}` | Cancel job (returns previousStatus) |
+| `GET /graph/analysis/patterns/{repo_id}` | Detect architectural pattern (Microservices / Layered / Hexagonal / Modular) |
+| `GET /graph/analysis/violations/{repo_id}` | Detect violations (god-class, cycles, orphans, oversized services) |
+| `GET /graph/analysis/dependency-metrics/{repo_id}` | Coupling, instability, bottlenecks, risk report |
+| `GET /graph/analysis/architecture/{repo_id}` | Function/class counts, top-called, language breakdown |
+| `GET /graph/analysis/impact/{repo_id}` | Change impact analysis |
+| `GET /graph/timeline/{repo_id}` | Raw commit + dependency event feed |
+| `GET /graph/timeline/{entity_type}/{entity_id}` | Analytical churn / change-frequency metrics |
+| `GET /graph/repos/{repo_id}/last_sha` | Last analyzed SHA (clone-then-filter incremental sync) |
+| `GET /decisions/{repo_id}` | Decision memory for a repository |
+
+### Sync Model
+
+git-analyzer-service uses **clone-then-filter** incremental sync:
+1. Fresh shallow clone on every cycle (`--depth=GIT_MAX_COMMITS`)
+2. Reads `lastAnalyzedSha` from graph-service
+3. Skips commits older than that SHA
+4. Clone directory deleted after every run (no persistent disk cache)
+
+See [`docs/PHASE2_RELEASE.md`](docs/PHASE2_RELEASE.md) for full details.
+
+### Phase 3 — Goal API (In Progress)
+
+Engineers express intent; the platform executes:
+
+```json
 POST /goals
 {
-  "goal": "Identify all services with no owner and no documentation",
-  "scope":  { "organizationId": "org_001" }
+  "goal": "Bu repository'de en riskli modülleri bul.",
+  "repositoryId": "my-service",
+  "organizationId": "org-001"
 }
 ```
-The platform decomposes the goal, retrieves relevant knowledge, executes analysis agents, and returns a structured result — not a chat response, but an engineering artifact.
 
-### Planner + Workflow Engine (Phase 2)
-
-Goals are broken into executable plans. Plans trigger workflows. Workflows coordinate agents.  
-Every step is observable, auditable, and replayable via the event stream.
-
-### Autonomous Agents (Phase 3)
-
-Specialised agents operate continuously on the knowledge graph:
-
-| Agent | Responsibility |
-|-------|----------------|
-| Repository Analysis Agent | Extracts architecture from source code |
-| Documentation Agent | Identifies gaps, generates missing docs |
-| Dependency Agent | Maps and monitors inter-service dependencies |
-| ADR Agent | Surfaces relevant architecture decisions |
-| Impact Agent | Predicts blast radius of proposed changes |
-
-Agents are first-class platform principals — authenticated, authorized, and audited identically to human engineers (see [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md)).
-
-### Why This Matters
-
-Most engineering organizations suffer from **institutional amnesia** — knowledge locked in individuals, scattered across wikis, buried in commit history.  
-This platform makes organizational engineering knowledge **persistent, searchable, connected, and continuously evolving**.
-
-The long-term outcome: an engineering organization where the platform understands the system as well as its best engineers do.
+The `goal-service` (:8009) classifies the goal, builds a rule-based plan, calls
+Phase 2 analysis endpoints, and returns a structured engineering report with
+findings, severity scores, and recommendations.
 
 ---
 
@@ -504,6 +535,8 @@ Every service exposes Swagger UI at `/docs`:
 - Graph: http://localhost:8005/docs
 - Search: http://localhost:8006/docs
 - Event: http://localhost:8007/docs
+- Git Analyzer: http://localhost:8008/docs
+- Goal Service: http://localhost:8009/docs *(Phase 3)*
 
 ---
 
