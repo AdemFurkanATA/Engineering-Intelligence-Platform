@@ -240,6 +240,26 @@ class ArchitectureAnalyzedPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Decision / ADR Event Payloads  (Phase 2 M3)
+# ---------------------------------------------------------------------------
+
+class DecisionRecordedPayload(BaseModel):
+    """Emitted when an ADR file or commit-message decision is detected."""
+    repository_id:     str             = Field(..., alias="repositoryId")
+    title:             str
+    status:            str             # accepted | rejected | deprecated | proposed | unknown
+    context:           str             = ""
+    decision:          str             = ""
+    consequences:      str             = ""
+    source_file:       str             = Field("", alias="sourceFile")
+    source_type:       str             = Field("adr_file", alias="sourceType")
+    related_entities:  List[str]       = Field(default_factory=list, alias="relatedEntities")
+    recorded_at:       Optional[str]   = Field(None, alias="recordedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
 # Factory helper
 # ---------------------------------------------------------------------------
 

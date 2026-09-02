@@ -31,6 +31,14 @@ from shared.kafka import EventPublisher, EventSubscriber
 from shared.models import GraphUpdatedPayload, create_event
 from shared.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 
+# Phase 2 — analysis modules
+sys.path.insert(0, os.path.dirname(__file__))
+from analyzers.pattern_detector   import detect_patterns
+from analyzers.violation_detector import detect_violations
+from analyzers.dependency_metrics import compute_dependency_metrics
+from analyzers.timeline_engine    import build_timeline, build_repo_timeline
+from analyzers.impact_analyzer    import analyze_impact
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,8 @@ subscriber = EventSubscriber(
         "dependency.detected", "commit.analyzed",
         # Phase 2.3
         "architecture.analyzed",
+        # Phase 2 M3
+        "decision.recorded",
     ],
 )
 
@@ -413,13 +423,17 @@ async def handle_event(topic: str, value: dict) -> None:
     elif event_type == "RepositoryCloned":
         # Update the Repository node with clone metadata (commit count etc.)
         repo_id = payload.get("repositoryId", "")
+        head_sha = payload.get("headSha")  # newest commit SHA after clone
         await _upsert_node(repo_id, "Repository", {
-            "cloneStatus":  "success",
-            "commitCount":  payload.get("commitCount", 0),
-            "sizeKb":       payload.get("sizeKb", 0),
-            "clonedAt":     payload.get("clonedAt", ""),
+            "cloneStatus":    "success",
+            "commitCount":    payload.get("commitCount", 0),
+            "sizeKb":         payload.get("sizeKb", 0),
+            "clonedAt":       payload.get("clonedAt", ""),
+            # Incremental sync tracking
+            **({"lastAnalyzedSha": head_sha, "lastAnalyzedAt": _now_iso()} if head_sha else {}),
         })
-        logger.info("Graph: Repository(%s) updated with clone metadata", repo_id)
+        logger.info("Graph: Repository(%s) updated with clone metadata (headSha=%s)",
+                    repo_id, head_sha)
         return  # No GraphUpdated event needed for metadata-only update
 
     elif event_type == "RepositoryCloneFailed":
@@ -487,9 +501,15 @@ async def handle_event(topic: str, value: dict) -> None:
             nodes_created += 1
             rels_created  += 1
 
-        # Link commit to repository
+        # Link commit to repository and update last analyzed SHA
         if await _node_exists(repo_id):
             await _add_relationship(commit_id, repo_id, "COMMITTED_TO")
+            # Keep repository's lastAnalyzedSha pointing to the most recent commit
+            # (first CommitAnalyzed is the newest because iter_commits is newest-first)
+            await _upsert_node(repo_id, "Repository", {
+                "lastAnalyzedSha": sha,
+                "lastAnalyzedAt":  _now_iso(),
+            })
             rels_created += 1
 
         logger.info(
@@ -541,6 +561,10 @@ async def handle_event(topic: str, value: dict) -> None:
             "Graph: ArchitectureAnalyzed for %s — %d symbols, %d relations",
             repo_id, len(symbols), len(relations),
         )
+
+    elif event_type == "DecisionRecorded":
+        await _handle_decision_recorded(value)
+        return  # _handle_decision_recorded emits its own GraphUpdated if needed
 
     else:
         return
@@ -1083,10 +1107,27 @@ async def repository_timeline(
     limit:      int           = Query(50,     ge=1, le=500),
     event_type: str           = Query("all",  description="'commit' | 'dependency' | 'all'"),
 ):
-    """Return a time-ordered event stream for a repository.
+    """Return a time-ordered **raw event stream** for a repository.
 
-    Merges commits and dependency additions into a single chronological list.
-    Supports filtering by time range and event type.
+    This endpoint merges commit and dependency-detection events into a single
+    chronological list.  It is a lightweight read of graph nodes — suitable
+    for displaying a feed or building simple charts.
+
+    **Distinct from** ``GET /graph/timeline/{entity_type}/{entity_id}``:
+    that endpoint computes *analytical* metrics (churn, refactoring signals,
+    change frequency, birth date, etc.) for any graph entity.  Use that one
+    when you need aggregated engineering insights rather than raw events.
+
+    Parameters
+    ----------
+    repo_id     : Repository node ID.
+    since/until : Optional ISO-8601 datetime bounds (inclusive).
+    limit       : Maximum events to return (1 – 500, default 50).
+    event_type  : ``'commit'`` | ``'dependency'`` | ``'all'`` (default).
+
+    Returns
+    -------
+    JSON with ``events`` list, ``total``, applied filters, and ``generatedAt``.
     """
     if event_type not in ("all", "commit", "dependency"):
         raise HTTPException(
@@ -1272,3 +1313,559 @@ async def analyze_architecture(repo_id: str):
     if _driver:
         return await _neo4j_architecture_analysis(repo_id)
     return _mem_architecture_analysis(repo_id)
+
+
+# ---------------------------------------------------------------------------
+# Incremental sync — last analyzed SHA
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/repos/{repo_id}/last_sha", tags=["Repositories"])
+async def get_last_sha(repo_id: str):
+    """Return the last analyzed commit SHA for a repository.
+
+    Used by git-analyzer-service to implement **commit-filter incremental sync**.
+
+    Sync model
+    ----------
+    git-analyzer-service always performs a **full shallow clone** (depth =
+    ``GIT_MAX_COMMITS``).  After cloning, it reads this SHA and skips any
+    commits older than or equal to it.  Only newer commits generate
+    ``CommitAnalyzed`` events.  The clone directory is deleted after every
+    run — there is no persistent on-disk cache between runs.
+
+    This model is sometimes called **"clone-then-filter"** to distinguish it
+    from a true **fetch/cache** incremental strategy (which would require a
+    persistent clone directory).  Clone-then-filter is safe for shallow repos
+    and simpler to operate; the trade-off is an extra clone per sync cycle.
+
+    Returns ``lastAnalyzedSha: null`` if the repository has never been
+    analyzed or the Repository node does not exist.
+    """
+    if not await _node_exists(repo_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{repo_id}' not found in graph.",
+        )
+
+    if _driver:
+        async with _driver.session() as session:
+            result = await session.run(
+                "MATCH (r:Repository {nodeId: $nodeId}) "
+                "RETURN r.lastAnalyzedSha AS sha, r.lastAnalyzedAt AS at",
+                nodeId=repo_id,
+            )
+            row = await result.single()
+            sha = row["sha"] if row else None
+            analyzed_at = row["at"] if row else None
+    else:
+        node = _nodes.get(repo_id)
+        if not node:
+            raise HTTPException(status_code=404, detail=f"Repository '{repo_id}' not found.")
+        sha = node.get("properties", {}).get("lastAnalyzedSha")
+        analyzed_at = node.get("properties", {}).get("lastAnalyzedAt")
+
+    return {
+        "repositoryId":   repo_id,
+        "lastAnalyzedSha": sha,
+        "lastAnalyzedAt":  analyzed_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# M2: Architectural pattern detection
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/analysis/patterns/{repo_id}", tags=["Analysis"])
+async def get_architecture_patterns(repo_id: str):
+    """Detect the dominant architectural pattern of a repository.
+
+    Returns the best-fit pattern (Microservices / Layered / Hexagonal /
+    ModularMonolith / Unknown) with a confidence score and evidence list.
+    Works with both Neo4j and in-memory graph backends.
+    """
+    if not await _node_exists(repo_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{repo_id}' not found in graph.",
+        )
+
+    graph_data = await _collect_graph_data(repo_id)
+    result = detect_patterns(graph_data)
+    return {
+        "repositoryId": repo_id,
+        "generatedAt":  _now_iso(),
+        **result.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# M2: Violation detection
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/analysis/violations/{repo_id}", tags=["Analysis"])
+async def get_architecture_violations(
+    repo_id:         str,
+    god_class_limit: int = 20,
+    service_limit:   int = 50,
+):
+    """Detect architectural violations in a repository's graph.
+
+    Violation types: god_class, dependency_cycle, orphan_node,
+    oversized_service, layer_violation, dead_code_candidate.
+
+    Each violation includes severity, description, and a recommended action.
+    """
+    if not await _node_exists(repo_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{repo_id}' not found in graph.",
+        )
+
+    graph_data = await _collect_graph_data(repo_id)
+    report = detect_violations(
+        graph_data,
+        god_class_threshold=god_class_limit,
+        service_size_threshold=service_limit,
+    )
+    return {
+        "repositoryId": repo_id,
+        "generatedAt":  _now_iso(),
+        **report.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# M2: Enriched dependency metrics
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/analysis/dependency-metrics/{repo_id}", tags=["Analysis"])
+async def get_dependency_metrics(
+    repo_id:              str,
+    critical_in_degree:   int   = 3,
+    high_coupling:        int   = 10,
+    high_instability:     float = 0.7,
+    top_n:                int   = 10,
+):
+    """Compute coupling, instability, and risk metrics for a repository.
+
+    Returns:
+    - packageGraph:      Dependency edge list for visualisation
+    - nodeMetrics:       Per-node coupling and instability scores
+    - criticalNodes:     Nodes with many dependents (high in-degree)
+    - bottlenecks:       Highest total-coupling nodes
+    - instabilityScores: Instability per node (0=stable, 1=unstable)
+    - riskReport:        Nodes with high coupling AND high instability
+    """
+    if not await _node_exists(repo_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{repo_id}' not found in graph.",
+        )
+
+    graph_data = await _collect_graph_data(repo_id)
+    report = compute_dependency_metrics(
+        graph_data,
+        critical_in_degree=critical_in_degree,
+        high_coupling=high_coupling,
+        high_instability=high_instability,
+        top_n=top_n,
+    )
+    return {
+        "repositoryId": repo_id,
+        "generatedAt":  _now_iso(),
+        **report.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: collect graph data for a repo
+# ---------------------------------------------------------------------------
+
+async def _collect_graph_data(repo_id: str) -> dict:
+    """Return nodes and relationships scoped to a repository as a plain dict.
+
+    In Neo4j mode: executes a Cypher query to fetch relevant subgraph.
+    In in-memory mode: filters from _nodes and _relationships.
+    """
+    if _driver:
+        async with _driver.session() as session:
+            # Fetch all nodes reachable from this repository
+            node_result = await session.run(
+                """
+                MATCH (r:Repository {nodeId: $repoId})
+                OPTIONAL MATCH (r)<-[:BELONGS_TO|COMMITTED_TO|DETECTED_IN*1..3]-(n)
+                RETURN DISTINCT n.nodeId AS id, labels(n)[0] AS label,
+                       properties(n) AS props
+                """,
+                repoId=repo_id,
+            )
+            node_rows = await node_result.data()
+
+            rel_result = await session.run(
+                """
+                MATCH (r:Repository {nodeId: $repoId})
+                OPTIONAL MATCH (r)<-[:BELONGS_TO|COMMITTED_TO|DETECTED_IN*1..3]-(n)
+                OPTIONAL MATCH (n)-[rel]->(m)
+                WHERE m IS NOT NULL
+                RETURN DISTINCT rel.sourceId AS src, rel.targetId AS tgt,
+                       type(rel) AS relType
+                """,
+                repoId=repo_id,
+            )
+            rel_rows = await rel_result.data()
+
+        nodes = {}
+        for row in node_rows:
+            if row.get("id"):
+                nodes[row["id"]] = {
+                    "label":      row.get("label", ""),
+                    "properties": dict(row.get("props") or {}),
+                }
+        # Always include the repository node itself
+        if repo_id not in nodes:
+            nodes[repo_id] = {"label": "Repository", "properties": {}}
+
+        relationships = [
+            {"sourceId": r["src"], "targetId": r["tgt"], "type": r["relType"]}
+            for r in rel_rows
+            if r.get("src") and r.get("tgt") and r.get("relType")
+        ]
+        return {"nodes": nodes, "relationships": relationships}
+
+    else:
+        # In-memory mode: return all nodes and relationships
+        # (scoping by repo is best-effort via repositoryId property)
+        filtered_nodes = {}
+        for nid, node in _nodes.items():
+            props = node.get("properties", {})
+            if nid == repo_id or props.get("repositoryId") == repo_id:
+                filtered_nodes[nid] = node
+
+        # If nothing found via repositoryId, return whole graph (small dev graphs)
+        if len(filtered_nodes) <= 1:
+            filtered_nodes = dict(_nodes)
+
+        return {
+            "nodes":         filtered_nodes,
+            "relationships": list(_relationships),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Decision Memory — in-memory store for DecisionRecorded events
+# ---------------------------------------------------------------------------
+
+_decisions: List[dict] = []   # list of decision payload dicts, newest-first
+
+
+async def _handle_decision_recorded(event: dict) -> None:
+    """Store decision records in-memory and as a Decision node in the graph.
+
+    Called directly from handle_event() when event_type == 'DecisionRecorded'.
+    Does NOT rely on @subscriber.on() (which does not exist on EventSubscriber).
+    """
+    payload = event.get("payload", {})
+    if not payload:
+        return
+
+    repo_id    = payload.get("repositoryId", payload.get("repository_id", ""))
+    title      = payload.get("title", "")
+    status     = payload.get("status", "unknown")
+    recorded_at = payload.get("recordedAt") or payload.get("recorded_at") or _now_iso()
+    source_file = payload.get("sourceFile") or payload.get("source_file") or ""
+
+    if not repo_id or not title:
+        return
+
+    node_id = f"decision:{repo_id}:{source_file}:{title[:40]}"
+
+    decision_entry = {
+        "nodeId":          node_id,
+        "repositoryId":    repo_id,
+        "title":           title,
+        "status":          status,
+        "context":         payload.get("context", ""),
+        "decision":        payload.get("decision", ""),
+        "consequences":    payload.get("consequences", ""),
+        "sourceFile":      source_file,
+        "sourceType":      payload.get("sourceType") or payload.get("source_type") or "adr_file",
+        "relatedEntities": payload.get("relatedEntities") or payload.get("related_entities") or [],
+        "recordedAt":      recorded_at,
+    }
+
+    # Upsert in-memory
+    _decisions[:] = [d for d in _decisions if d.get("nodeId") != node_id]
+    _decisions.insert(0, decision_entry)
+
+    # Upsert graph node
+    if _driver:
+        try:
+            async with _driver.session() as session:
+                await session.run(
+                    """
+                    MERGE (d:Decision {nodeId: $nodeId})
+                    SET d += {
+                        repositoryId: $repositoryId,
+                        title: $title,
+                        status: $status,
+                        context: $context,
+                        decision: $decision,
+                        consequences: $consequences,
+                        sourceFile: $sourceFile,
+                        sourceType: $sourceType,
+                        recordedAt: $recordedAt,
+                        updatedAt: datetime()
+                    }
+                    WITH d
+                    MATCH (r:Repository {nodeId: $repositoryId})
+                    MERGE (d)-[:RECORDED_FOR]->(r)
+                    """,
+                    **{k: v for k, v in decision_entry.items()
+                       if k != "relatedEntities"},
+                )
+        except Exception as exc:
+            logger.warning("Neo4j Decision upsert failed: %s", exc)
+    else:
+        _nodes[node_id] = {
+            "label": "Decision",
+            "properties": decision_entry,
+        }
+        _relationships.append({
+            "sourceId": node_id,
+            "targetId": repo_id,
+            "type":     "RECORDED_FOR",
+        })
+
+    logger.debug("Decision stored: %s [%s] for %s", title, status, repo_id)
+
+
+# ---------------------------------------------------------------------------
+# M3: Timeline endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/timeline/{entity_type}/{entity_id}", tags=["Timeline"])
+async def get_entity_timeline(
+    entity_type: str,
+    entity_id:   str,
+    limit:       int = 50,
+):
+    """Return **analytical timeline metrics** for any graph entity.
+
+    **Distinct from** ``GET /graph/timeline/{repo_id}``:
+    that endpoint returns a raw chronological event feed (commits +
+    dependency additions).  This endpoint computes *aggregated* engineering
+    metrics derived from the commit history:
+
+    - ``birthDate``        — date of the entity's first commit
+    - ``lastModified``     — date of the most recent commit touching it
+    - ``changeFrequency``  — commits per week over the analysis window
+    - ``churn``            — lines added + deleted over recent period
+    - ``refactoringSignals`` — heuristic signals of refactoring activity
+    - ``recentEvents``     — last N significant commits (summary)
+    - ``repoSummary``      — high-level repo stats (repository entity only)
+
+    Supported entity types
+    ----------------------
+    ``repository`` | ``service`` | ``module`` | ``class`` | ``function``
+
+    Parameters
+    ----------
+    entity_type : One of the supported types listed above.
+    entity_id   : The graph node ID of the target entity.
+    limit       : Maximum recent events to include (default 50).
+    """
+    graph_data = await _collect_graph_data_with_commits(entity_id)
+
+    if entity_type.lower() == "repository":
+        repo_summary = build_repo_timeline(graph_data)
+        entity_timeline = build_timeline(entity_id, graph_data)
+        return {
+            "entityId":     entity_id,
+            "entityType":   entity_type,
+            "generatedAt":  _now_iso(),
+            "repoSummary":  repo_summary,
+            **entity_timeline.to_dict(),
+        }
+
+    timeline = build_timeline(entity_id, graph_data, max_events=limit)
+    return {
+        "generatedAt": _now_iso(),
+        **timeline.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# M3: Impact analysis endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/graph/impact/analyze", tags=["Impact"])
+async def post_impact_analyze(body: dict):
+    """Compute the ripple-effect impact of changing a graph entity.
+
+    Request body:
+      {
+        "entityId":   "...",
+        "changeType": "modify" | "delete" | "add",
+        "depth":      3,          # optional, default 3
+        "maxAffected": 200        # optional, default 200
+      }
+
+    Returns affected entities with risk levels and critical paths.
+    """
+    entity_id   = body.get("entityId", "")
+    change_type = body.get("changeType", "modify")
+    depth       = int(body.get("depth", 3))
+    max_affected = int(body.get("maxAffected", 200))
+
+    if not entity_id:
+        raise HTTPException(status_code=422, detail="entityId is required.")
+
+    graph_data = await _collect_graph_data_for_impact(entity_id)
+    report     = analyze_impact(
+        entity_id,
+        graph_data,
+        change_type=change_type,
+        depth=depth,
+        max_affected=max_affected,
+    )
+    return {
+        "generatedAt": _now_iso(),
+        **report.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# M3: Decision memory endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/decisions/{repo_id}", tags=["Decisions"])
+async def get_decisions(
+    repo_id: str,
+    status:  Optional[str] = None,
+    source:  Optional[str] = None,
+    limit:   int = 50,
+):
+    """List all recorded decisions (ADRs + commit signals) for a repository.
+
+    Query params:
+      status: filter by status (accepted | rejected | deprecated | proposed)
+      source: filter by sourceType (adr_file | commit_message)
+      limit:  max results (default 50)
+    """
+    if _driver:
+        try:
+            async with _driver.session() as session:
+                result = await session.run(
+                    """
+                    MATCH (d:Decision {repositoryId: $repoId})
+                    RETURN d
+                    ORDER BY d.recordedAt DESC
+                    LIMIT $limit
+                    """,
+                    repoId=repo_id, limit=limit,
+                )
+                rows = await result.data()
+            decisions = [dict(r["d"]) for r in rows]
+        except Exception as exc:
+            logger.warning("Neo4j decision fetch failed: %s — falling back to memory", exc)
+            decisions = [d for d in _decisions if d.get("repositoryId") == repo_id]
+    else:
+        decisions = [d for d in _decisions if d.get("repositoryId") == repo_id]
+
+    # Filters
+    if status:
+        decisions = [d for d in decisions if d.get("status", "").lower() == status.lower()]
+    if source:
+        decisions = [d for d in decisions if d.get("sourceType", "").lower() == source.lower()]
+
+    return {
+        "repositoryId": repo_id,
+        "total":        len(decisions),
+        "decisions":    decisions[:limit],
+    }
+
+
+@app.get("/graph/decisions/{repo_id}/{decision_id:path}", tags=["Decisions"])
+async def get_decision_detail(repo_id: str, decision_id: str):
+    """Get a single decision by its node ID."""
+    # In-memory lookup
+    for d in _decisions:
+        if d.get("nodeId") == decision_id and d.get("repositoryId") == repo_id:
+            return d
+
+    if _driver:
+        try:
+            async with _driver.session() as session:
+                result = await session.run(
+                    "MATCH (d:Decision {nodeId: $id, repositoryId: $repoId}) RETURN d",
+                    id=decision_id, repoId=repo_id,
+                )
+                row = await result.single()
+                if row:
+                    return dict(row["d"])
+        except Exception:
+            pass
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Decision '{decision_id}' not found for repo '{repo_id}'.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: collect graph data WITH commits for timeline
+# ---------------------------------------------------------------------------
+
+async def _collect_graph_data_with_commits(entity_id: str) -> dict:
+    """Extend _collect_graph_data with commit data from Decision nodes."""
+    graph_data = await _collect_graph_data(entity_id)
+
+    # Reconstruct commits from CommitAnalyzed events stored as nodes
+    commits = []
+    for nid, node in _nodes.items():
+        if node.get("label") == "Commit":
+            props = node.get("properties", {})
+            commits.append({
+                "sha":          props.get("sha", ""),
+                "message":      props.get("message", ""),
+                "authorName":   props.get("authorName", ""),
+                "authorEmail":  props.get("authorEmail", ""),
+                "committedAt":  props.get("committedAt", ""),
+                "filesChanged": props.get("filesChanged", []),
+                "linesAdded":   props.get("linesAdded", 0),
+                "linesDeleted": props.get("linesDeleted", 0),
+            })
+
+    graph_data["commits"] = commits
+    return graph_data
+
+
+async def _collect_graph_data_for_impact(entity_id: str) -> dict:
+    """Return the full graph (all nodes and relationships) for impact traversal."""
+    if _driver:
+        async with _driver.session() as session:
+            node_result = await session.run(
+                "MATCH (n) RETURN n.nodeId AS id, labels(n)[0] AS label, properties(n) AS props"
+            )
+            node_rows = await node_result.data()
+
+            rel_result = await session.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE a.nodeId IS NOT NULL AND b.nodeId IS NOT NULL
+                RETURN a.nodeId AS src, type(r) AS relType, b.nodeId AS tgt
+                """
+            )
+            rel_rows = await rel_result.data()
+
+        nodes = {
+            row["id"]: {"label": row.get("label", ""), "properties": dict(row.get("props") or {})}
+            for row in node_rows if row.get("id")
+        }
+        relationships = [
+            {"sourceId": r["src"], "targetId": r["tgt"], "type": r["relType"]}
+            for r in rel_rows if r.get("src") and r.get("tgt")
+        ]
+        return {"nodes": nodes, "relationships": relationships}
+    else:
+        return {"nodes": dict(_nodes), "relationships": list(_relationships)}
