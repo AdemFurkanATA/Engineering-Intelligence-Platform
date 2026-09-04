@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -125,7 +125,10 @@ class GoalReport(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Goal
-# ---------------------------------------------------------------------------
+# Valid entity types for impact scoping — used in GoalRequest and the planner.
+# Defined here so both the API validation layer and the planner share one source.
+EntityType = Literal["function", "class", "module", "service", "component"]
+
 
 class GoalRequest(BaseModel):
     """Input payload for POST /goals.
@@ -135,8 +138,12 @@ class GoalRequest(BaseModel):
     goal            : Natural-language engineering goal (required).
     repository_id   : Target repository node ID.
     organization_id : Organization ID for cross-repo goals.
-    entity_type     : Optional entity focus — "service" | "module" | "class" | "function".
-                      Used by impact_analysis to scope the blast-radius calculation.
+    entity_type     : Optional entity focus for impact_analysis scoping.
+                      Must be one of: ``function`` | ``class`` | ``module`` |
+                      ``service`` | ``component``.
+                      Typos (e.g. "servcie") are rejected with HTTP 422 so
+                      that the caller gets an actionable error instead of a
+                      silently wrong analysis.
     entity_id       : Optional graph node ID of the specific entity to focus on.
     change_scope    : Optional free-text description of the planned change.
                       E.g. "Remove the PaymentService.processRefund method".
@@ -145,14 +152,17 @@ class GoalRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     goal:            str  = Field(..., min_length=5, description="Natural-language engineering goal")
-    repository_id:   Optional[str] = Field(None, alias="repositoryId")
-    organization_id: Optional[str] = Field(None, alias="organizationId")
-    entity_type:     Optional[str] = Field(None, alias="entityType",
-                                           description="service | module | class | function")
-    entity_id:       Optional[str] = Field(None, alias="entityId",
-                                           description="Graph node ID of the target entity")
-    change_scope:    Optional[str] = Field(None, alias="changeScope",
-                                           description="Description of the planned change")
+    repository_id:   Optional[str]        = Field(None, alias="repositoryId")
+    organization_id: Optional[str]        = Field(None, alias="organizationId")
+    entity_type:     Optional[EntityType] = Field(
+        None,
+        alias="entityType",
+        description="function | class | module | service | component",
+    )
+    entity_id:       Optional[str]        = Field(None, alias="entityId",
+                                                  description="Graph node ID of the target entity")
+    change_scope:    Optional[str]        = Field(None, alias="changeScope",
+                                                  description="Description of the planned change")
 
 
 class Goal(BaseModel):

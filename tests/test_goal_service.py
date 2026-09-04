@@ -248,6 +248,9 @@ class TestReportBuilder:
         # Recommendation generated
         recs = [r for r in report.recommendations if "PaymentService" in r.title]
         assert len(recs) >= 1
+        # entity_timeline raw data included in data_points for consumers
+        assert "entityTimeline" in report.data_points
+        assert report.data_points["entityTimeline"]["changeFrequency"] == 14
 
     def test_impact_report_entity_refactoring_signals(self):
         """entity_timeline refactoringSignals produce refactoring_signal findings."""
@@ -378,6 +381,35 @@ class TestGoalAPI:
         data = r.json()
         assert "goalId" in data
         assert data["status"] == "submitted"
+
+    def test_invalid_entity_type_returns_422(self, client):
+        """Typo in entityType (e.g. 'servcie') must be rejected with 422, not silently
+        fall back to 'function' and produce a wrong analysis."""
+        r = client.post("/goals", json={
+            "goal": "Impact analysis of payment service",
+            "repositoryId": "repo-test",
+            "entityType": "servcie",   # deliberate typo
+            "entityId": "PaymentService",
+        })
+        assert r.status_code == 422
+        detail = r.json()["detail"]
+        # Pydantic v2 uses type='literal_error' for Literal violations
+        error_types = [e.get("type") for e in detail]
+        assert "literal_error" in error_types
+        # The rejected input value must appear in the error
+        inputs = [e.get("input") for e in detail]
+        assert "servcie" in inputs
+
+    def test_valid_entity_types_accepted(self, client):
+        """All valid entityType values must be accepted."""
+        for etype in ("function", "class", "module", "service", "component"):
+            r = client.post("/goals", json={
+                "goal": "Impact analysis for entity",
+                "repositoryId": "repo-x",
+                "entityType": etype,
+                "entityId": "SomeNode",
+            })
+            assert r.status_code == 202, f"entityType={etype!r} should be accepted, got {r.status_code}"
 
     def test_list_goals_empty(self, client):
         r = client.get("/goals")

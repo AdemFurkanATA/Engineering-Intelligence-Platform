@@ -277,6 +277,10 @@ def _build_impact_report(goal: Goal, plan: Plan, start_ts: float) -> GoalReport:
             "dependencyMetrics": dep_metrics,
             "violations":        violations,
             "architecture":      architecture,
+            # entity_timeline included so report consumers can access raw evidence
+            # and detail metrics (churn series, birth date, refactoring signals).
+            # Only present when entityId was supplied in the GoalRequest.
+            **({"entityTimeline": entity_timeline} if entity_timeline else {}),
         },
         execution_ms = int((time.monotonic() - start_ts) * 1000),
     )
