@@ -155,6 +155,58 @@ class TestPlanBuilder:
         assert et_step.params.get("_entity_type") == "class"
         assert et_step.params.get("_entity_id") == "UserClass"
 
+    # ----- Phase 3.2: parallel_group tests -----
+
+    def test_risk_plan_has_parallel_groups(self):
+        """violations + dependency_metrics share 'risk-core' group."""
+        plan = build_plan(GoalType.RISK_ANALYSIS, "repo-pg1")
+        core = [s for s in plan.steps if s.parallel_group == "risk-core"]
+        names = {s.name for s in core}
+        assert names == {"violations", "dependency_metrics"}
+
+    def test_impact_plan_has_parallel_groups(self):
+        """dependency_metrics + violations share 'impact-core' group."""
+        plan = build_plan(GoalType.IMPACT_ANALYSIS, "repo-pg2")
+        core = [s for s in plan.steps if s.parallel_group == "impact-core"]
+        names = {s.name for s in core}
+        assert names == {"dependency_metrics", "violations"}
+
+    def test_architecture_plan_all_steps_parallel(self):
+        """All 4 architecture steps share 'arch-core'."""
+        plan = build_plan(GoalType.ARCHITECTURE_REPORT, "repo-pg3")
+        core = [s for s in plan.steps if s.parallel_group == "arch-core"]
+        assert len(core) == 4
+
+    def test_make_batches_sequential_when_no_group(self):
+        """Steps with parallel_group=None each form their own batch."""
+        from executor import _make_batches
+        from models import PlanStep
+        steps = [
+            PlanStep(name="a", description="", endpoint="/a", service="s", parallel_group=None),
+            PlanStep(name="b", description="", endpoint="/b", service="s", parallel_group=None),
+            PlanStep(name="c", description="", endpoint="/c", service="s", parallel_group=None),
+        ]
+        batches = _make_batches(steps)
+        assert len(batches) == 3
+        assert all(len(b) == 1 for b in batches)
+
+    def test_make_batches_groups_consecutive(self):
+        """Steps with the same group are batched together."""
+        from executor import _make_batches
+        from models import PlanStep
+        steps = [
+            PlanStep(name="a", description="", endpoint="/a", service="s", parallel_group="g1"),
+            PlanStep(name="b", description="", endpoint="/b", service="s", parallel_group="g1"),
+            PlanStep(name="c", description="", endpoint="/c", service="s", parallel_group=None),
+            PlanStep(name="d", description="", endpoint="/d", service="s", parallel_group="g2"),
+            PlanStep(name="e", description="", endpoint="/e", service="s", parallel_group="g2"),
+        ]
+        batches = _make_batches(steps)
+        assert len(batches) == 3
+        assert {s.name for s in batches[0]} == {"a", "b"}
+        assert batches[1][0].name == "c"
+        assert {s.name for s in batches[2]} == {"d", "e"}
+
 
 # ---------------------------------------------------------------------------
 # Report builder tests
@@ -475,3 +527,136 @@ class TestGoalAPI:
             _time.sleep(0.1)
         # At minimum the goal was submitted successfully
         assert goal_data["goal_id"] == goal_id
+
+    def test_idempotency_key_returns_existing_goal(self, client):
+        """Same idempotencyKey on a second submit returns the existing goal (HTTP 200)."""
+        key = "idem-key-abc-123"
+        r1 = client.post("/goals", json={
+            "goal": "Risk analysis for my repo",
+            "repositoryId": "repo-idem",
+            "idempotencyKey": key,
+        })
+        assert r1.status_code == 202
+        goal_id_1 = r1.json()["goalId"]
+
+        # Second submit with same key
+        r2 = client.post("/goals", json={
+            "goal": "Risk analysis for my repo",
+            "repositoryId": "repo-idem",
+            "idempotencyKey": key,
+        })
+        assert r2.status_code == 200
+        data2 = r2.json()
+        assert data2["goalId"] == goal_id_1
+        assert data2.get("idempotent") is True
+
+    def test_idempotency_different_keys_create_separate_goals(self, client):
+        """Different idempotencyKeys always create new goals."""
+        r1 = client.post("/goals", json={"goal": "Risk analysis", "repositoryId": "r", "idempotencyKey": "k1"})
+        r2 = client.post("/goals", json={"goal": "Risk analysis", "repositoryId": "r", "idempotencyKey": "k2"})
+        assert r1.status_code == 202
+        assert r2.status_code == 202
+        assert r1.json()["goalId"] != r2.json()["goalId"]
+
+
+# ---------------------------------------------------------------------------
+# Executor unit tests (Phase 3.2 — retry + parallel)
+# ---------------------------------------------------------------------------
+
+import asyncio as _asyncio
+from unittest.mock import AsyncMock, patch
+
+
+class TestExecutorRetry:
+
+    def _make_plan(self, required=True, parallel_group=None):
+        from models import GoalType, Plan, PlanStep
+        step = PlanStep(
+            name="test_step",
+            description="test",
+            endpoint="/test",
+            service="graph-service",
+            required=required,
+            parallel_group=parallel_group,
+        )
+        return Plan(goal_type=GoalType.RISK_ANALYSIS, steps=[step])
+
+    @staticmethod
+    def _make_resp(status: int, body=None):
+        """Create an httpx.Response with a request attached (required for raise_for_status)."""
+        import httpx
+        req = httpx.Request("GET", "http://localhost:9999/test")
+        resp = httpx.Response(status, json=body or {}, request=req)
+        return resp
+
+    @staticmethod
+    def _make_err(status: int):
+        import httpx
+        req = httpx.Request("GET", "http://localhost:9999/test")
+        resp = httpx.Response(status, text="error", request=req)
+        return httpx.HTTPStatusError(str(status), request=req, response=resp)
+
+    def _mock_client(self, side_effects):
+        """Build an AsyncMock httpx.AsyncClient whose .get() uses side_effects list."""
+        import httpx
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(side_effect=side_effects)
+        return mock_client
+
+    def test_retry_on_5xx_then_success(self):
+        """Executor retries 5xx and succeeds on the 3rd attempt."""
+        from executor import execute_plan
+
+        err503 = self._make_err(503)
+        ok_resp = self._make_resp(200, {"ok": True})
+
+        mock_client = self._mock_client([err503, err503, ok_resp])
+        plan = self._make_plan()
+
+        async def run():
+            with patch("asyncio.sleep", new=AsyncMock()):
+                with patch("httpx.AsyncClient", return_value=mock_client):
+                    return await execute_plan(plan, {"graph-service": "http://localhost:9999"})
+
+        ok, err = _asyncio.get_event_loop().run_until_complete(run())
+        assert ok is True, f"Expected success, got err={err}"
+        assert err is None
+        assert mock_client.get.call_count == 3
+        assert plan.steps[0].retries == 2   # 2 retries before success on attempt 3
+
+    def test_no_retry_on_4xx(self):
+        """Executor does NOT retry 4xx errors (client-side, deterministic)."""
+        from executor import execute_plan
+
+        err400 = self._make_err(400)
+        mock_client = self._mock_client([err400])
+        plan = self._make_plan(required=True)
+
+        async def run():
+            with patch("httpx.AsyncClient", return_value=mock_client):
+                return await execute_plan(plan, {"graph-service": "http://localhost:9999"})
+
+        ok, err = _asyncio.get_event_loop().run_until_complete(run())
+        assert ok is False
+        assert mock_client.get.call_count == 1   # no retry on 4xx
+
+    def test_optional_step_skipped_after_retries_exhausted(self):
+        """Optional step exhausts retries → SKIPPED, plan succeeds."""
+        from executor import execute_plan, MAX_RETRIES
+        from models import StepStatus
+
+        err503 = self._make_err(503)
+        mock_client = self._mock_client([err503] * MAX_RETRIES)
+        plan = self._make_plan(required=False)
+
+        async def run():
+            with patch("asyncio.sleep", new=AsyncMock()):
+                with patch("httpx.AsyncClient", return_value=mock_client):
+                    return await execute_plan(plan, {"graph-service": "http://localhost:9999"})
+
+        ok, err = _asyncio.get_event_loop().run_until_complete(run())
+        assert ok is True
+        assert err is None
+        assert plan.steps[0].status == StepStatus.SKIPPED

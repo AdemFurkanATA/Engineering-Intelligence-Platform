@@ -104,6 +104,7 @@ def _risk_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/violations/{repo_id}",
             required=True,
+            parallel_group="risk-core",
         ),
         PlanStep(
             name="dependency_metrics",
@@ -111,6 +112,7 @@ def _risk_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/dependency-metrics/{repo_id}",
             required=True,
+            parallel_group="risk-core",
         ),
         PlanStep(
             name="pattern",
@@ -118,6 +120,7 @@ def _risk_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/patterns/{repo_id}",
             required=False,
+            parallel_group="risk-enrich",
         ),
         PlanStep(
             name="timeline",
@@ -126,6 +129,7 @@ def _risk_steps(repo_id: str) -> List[PlanStep]:
             endpoint=f"/graph/timeline/{repo_id}",
             params={"limit": 20, "event_type": "commit"},
             required=False,
+            parallel_group="risk-enrich",
         ),
     ]
 
@@ -138,6 +142,7 @@ def _impact_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/dependency-metrics/{repo_id}",
             required=True,
+            parallel_group="impact-core",
         ),
         PlanStep(
             name="violations",
@@ -145,6 +150,7 @@ def _impact_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/violations/{repo_id}",
             required=True,
+            parallel_group="impact-core",
         ),
         PlanStep(
             name="architecture",
@@ -152,6 +158,7 @@ def _impact_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/architecture/{repo_id}",
             required=False,
+            parallel_group="impact-enrich",
         ),
         PlanStep(
             name="timeline",
@@ -160,6 +167,7 @@ def _impact_steps(repo_id: str) -> List[PlanStep]:
             endpoint=f"/graph/timeline/{repo_id}",
             params={"limit": 10, "event_type": "all"},
             required=False,
+            parallel_group="impact-enrich",
         ),
     ]
 
@@ -172,6 +180,7 @@ def _architecture_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/patterns/{repo_id}",
             required=True,
+            parallel_group="arch-core",
         ),
         PlanStep(
             name="violations",
@@ -179,6 +188,7 @@ def _architecture_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/violations/{repo_id}",
             required=True,
+            parallel_group="arch-core",
         ),
         PlanStep(
             name="architecture",
@@ -186,6 +196,7 @@ def _architecture_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/architecture/{repo_id}",
             required=True,
+            parallel_group="arch-core",
         ),
         PlanStep(
             name="dependency_metrics",
@@ -193,6 +204,7 @@ def _architecture_steps(repo_id: str) -> List[PlanStep]:
             service="graph-service",
             endpoint=f"/graph/analysis/dependency-metrics/{repo_id}",
             required=False,
+            parallel_group="arch-core",
         ),
     ]
 

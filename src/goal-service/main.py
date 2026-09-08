@@ -175,9 +175,9 @@ app = FastAPI(
     description=(
         "Phase 3 Goal API — submit engineering goals and receive structured "
         "reports produced by orchestrating Phase 2 analysis endpoints.\n\n"
-        "Phase 3.1: Goals persisted to PostgreSQL (DATABASE_URL) or in-memory."
+        "Phase 3.2: Retry (3x backoff), parallel steps, idempotency key."
     ),
-    version="3.1.0",
+    version="3.2.0",
     lifespan=lifespan,
 )
 
@@ -198,7 +198,7 @@ async def health():
     return {
         "status":  "ok",
         "service": "goal-service",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "backend": _store.backend,
         "running": len(_tasks),
         "services": SERVICE_URLS,
@@ -225,16 +225,39 @@ async def submit_goal(req: GoalRequest) -> dict:
     Optionally scope the analysis:
     - **entityType** / **entityId** — focus on a specific node (for impact analysis)
     - **changeScope** — describe the planned change for context
+    - **idempotencyKey** — if a non-failed goal with this key already exists,
+      the server returns it (HTTP 200) instead of creating a duplicate.
 
     Returns a goal record with `goalId`.  Poll `GET /goals/{goalId}` for status.
     """
+    # --- Idempotency check ---
+    if req.idempotency_key:
+        existing = await _store.find_by_idempotency_key(req.idempotency_key)
+        if existing and existing.status not in (GoalStatus.FAILED, GoalStatus.CANCELLED):
+            logger.info(
+                "Idempotency hit for key=%s → goal %s",
+                req.idempotency_key, existing.goal_id[:8],
+            )
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "goalId":      existing.goal_id,
+                    "status":      existing.status.value,
+                    "submittedAt": existing.submitted_at,
+                    "message":     "Existing goal returned (idempotency key match).",
+                    "idempotent":  True,
+                },
+            )
+
     goal = Goal(
-        goal_text       = req.goal,
-        repository_id   = req.repository_id,
-        organization_id = req.organization_id,
-        entity_type     = req.entity_type,
-        entity_id       = req.entity_id,
-        change_scope    = req.change_scope,
+        goal_text        = req.goal,
+        repository_id    = req.repository_id,
+        organization_id  = req.organization_id,
+        entity_type      = req.entity_type,
+        entity_id        = req.entity_id,
+        change_scope     = req.change_scope,
+        idempotency_key  = req.idempotency_key,
     )
     await _store.save(goal)
 

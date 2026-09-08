@@ -68,6 +68,10 @@ class GoalStore(ABC):
         """Remove a goal.  Returns True if it existed."""
 
     @abstractmethod
+    async def find_by_idempotency_key(self, key: str):
+        """Return the most recent goal with this idempotency_key, or None."""
+
+    @abstractmethod
     async def close(self) -> None:
         """Release resources (e.g. connection pool)."""
 
@@ -114,6 +118,13 @@ class InMemoryGoalStore(GoalStore):
 
     async def delete(self, goal_id: str) -> bool:
         return self._data.pop(goal_id, None) is not None
+
+    async def find_by_idempotency_key(self, key: str):
+        """Linear scan — acceptable for in-memory store."""
+        for goal in reversed(list(self._data.values())):
+            if getattr(goal, 'idempotency_key', None) == key:
+                return goal
+        return None
 
     async def close(self) -> None:
         pass  # nothing to release
@@ -235,6 +246,18 @@ class PostgreSQLGoalStore(GoalStore):
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(_DELETE_SQL, goal_id)
         return row is not None
+
+    async def find_by_idempotency_key(self, key: str):
+        sql = (
+            "SELECT data FROM goals "
+            "WHERE data->>'idempotency_key' = $1 "
+            "ORDER BY created_at DESC LIMIT 1;"
+        )
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(sql, key)
+        if row is None:
+            return None
+        return _deserialise_goal(json.loads(row["data"]))
 
     async def close(self) -> None:
         await self._pool.close()

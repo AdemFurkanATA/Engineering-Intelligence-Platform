@@ -67,16 +67,21 @@ class StepStatus(str, Enum):
 
 class PlanStep(BaseModel):
     """A single executable step in a goal plan."""
-    name:        str
-    description: str
-    endpoint:    str            # path relative to service base, e.g. /graph/analysis/patterns/{repo_id}
-    service:     str            # "graph-service" | "git-analyzer-service"
-    params:      Dict[str, Any] = Field(default_factory=dict)
-    required:    bool           = True
-    status:      StepStatus     = StepStatus.PENDING
-    result:      Optional[Any]  = None
-    error:       Optional[str]  = None
-    duration_ms: Optional[int]  = None
+    name:           str
+    description:    str
+    endpoint:       str            # path relative to service base
+    service:        str            # "graph-service" | "git-analyzer-service"
+    params:         Dict[str, Any] = Field(default_factory=dict)
+    required:       bool           = True
+    status:         StepStatus     = StepStatus.PENDING
+    result:         Optional[Any]  = None
+    error:          Optional[str]  = None
+    duration_ms:    Optional[int]  = None
+    # Steps sharing the same parallel_group string execute concurrently.
+    # Steps with parallel_group=None execute sequentially (default).
+    parallel_group: Optional[str]  = None
+    # Number of retry attempts made (informational, set by executor)
+    retries:        int            = 0
 
 
 class Plan(BaseModel):
@@ -148,21 +153,29 @@ class GoalRequest(BaseModel):
     change_scope    : Optional free-text description of the planned change.
                       E.g. "Remove the PaymentService.processRefund method".
                       Included in the plan as context for impact analysis.
+    idempotency_key : Optional caller-supplied key (e.g. a UUID or hash).
+                      If a non-cancelled, non-failed goal with the same key
+                      already exists, the server returns that goal instead of
+                      creating a duplicate.  Prevents double-submission on
+                      client retries.
     """
     model_config = ConfigDict(populate_by_name=True)
 
-    goal:            str  = Field(..., min_length=5, description="Natural-language engineering goal")
-    repository_id:   Optional[str]        = Field(None, alias="repositoryId")
-    organization_id: Optional[str]        = Field(None, alias="organizationId")
-    entity_type:     Optional[EntityType] = Field(
+    goal:             str  = Field(..., min_length=5, description="Natural-language engineering goal")
+    repository_id:    Optional[str]        = Field(None, alias="repositoryId")
+    organization_id:  Optional[str]        = Field(None, alias="organizationId")
+    entity_type:      Optional[EntityType] = Field(
         None,
         alias="entityType",
         description="function | class | module | service | component",
     )
-    entity_id:       Optional[str]        = Field(None, alias="entityId",
-                                                  description="Graph node ID of the target entity")
-    change_scope:    Optional[str]        = Field(None, alias="changeScope",
-                                                  description="Description of the planned change")
+    entity_id:        Optional[str]        = Field(None, alias="entityId",
+                                                   description="Graph node ID of the target entity")
+    change_scope:     Optional[str]        = Field(None, alias="changeScope",
+                                                   description="Description of the planned change")
+    idempotency_key:  Optional[str]        = Field(None, alias="idempotencyKey",
+                                                   description="Dedup key — same key returns existing goal")
+
 
 
 class Goal(BaseModel):
@@ -177,6 +190,8 @@ class Goal(BaseModel):
     entity_type:     Optional[str] = None   # service | module | class | function
     entity_id:       Optional[str] = None   # specific graph node ID to focus on
     change_scope:    Optional[str] = None   # description of planned change
+    # Idempotency (Phase 3.2): dedup key set by caller; prevents duplicate goals
+    idempotency_key: Optional[str] = None
     plan:            Optional[Plan]       = None
     report:          Optional[GoalReport] = None
     error:           Optional[str]        = None
